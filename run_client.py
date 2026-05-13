@@ -1,12 +1,12 @@
 import sys
 import os
+from pathlib import Path
 
-# Wichtig: Projekt-Root zum Python-Path hinzufügen
-sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+# Projekt-Root zum Python-Path hinzufügen
+root = Path(__file__).parent.absolute()
+sys.path.insert(0, str(root))
 
 from client.main import main
-import asyncio
 
 if __name__ == "__main__":
-    print("🚀 MeshCompute Client wird gestartet...")
-    asyncio.run(main())
+    main()

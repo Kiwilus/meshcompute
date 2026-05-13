@@ -12,14 +12,12 @@ init(autoreset=True)
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
 
-# Redis-Client global (wird beim Start verbunden)
 r = None
 
 async def authenticate(data: dict) -> bool:
     return data.get("auth_token") == AUTH_TOKEN
 
 async def handler(websocket):
-    """Behandelt Controller-Verbindungen. Bots verbinden sich direkt mit Redis."""
     try:
         first_msg = await websocket.recv()
         data = json.loads(first_msg)
@@ -32,13 +30,11 @@ async def handler(websocket):
 
         if client_type == "controller":
             logger.info(f"{Fore.MAGENTA}Controller connected{Style.RESET_ALL}")
-            # Controller-Schleife
             async for message in websocket:
                 msg = json.loads(message)
                 if msg["type"] == "command":
                     action = msg.get("action")
                     if action == "list":
-                        # Bots aus Redis holen (alle, die in den letzten 60 Sek. Heartbeat hatten)
                         bot_ids = await r.smembers("active_bots")
                         bot_list = []
                         for bot_id in bot_ids:
@@ -57,8 +53,7 @@ async def handler(websocket):
                             "data": {"bots": bot_list, "count": len(bot_list)}
                         }))
                     else:
-                        # Aufgabe in tasks-Queue legen
-                        task_id = msg.get("task_id", str(int(time.time()*1000)))
+                        task_id = msg.get("task_id", str(int(time.time() * 1000)))
                         task_data = {
                             "task_id": task_id,
                             "action": action,
@@ -66,25 +61,22 @@ async def handler(websocket):
                             "payload": msg.get("payload")
                         }
                         await r.rpush("mesh:tasks", json.dumps(task_data))
-                        # Nicht warten, Ergebnis kommt asynchron
-                        # (Controller muss später Ergebnis abfragen – oder wir nutzen Pub/Sub)
                         await websocket.send(json.dumps({
                             "type": "info",
                             "message": f"Task {task_id} queued."
                         }))
                 elif msg["type"] == "get_result":
                     task_id = msg.get("task_id")
-                    # Blockierend auf Ergebnis warten (30 s Timeout)
                     result = await r.blpop(f"mesh:results:{task_id}", timeout=30)
                     if result:
                         _, payload = result
-                        await websocket.send(payload.decode())
+                        # FIX: decode_responses=True → payload ist bereits str, kein .decode() nötig
+                        await websocket.send(payload)
                     else:
                         await websocket.send(json.dumps({
                             "type": "error",
                             "message": f"Timeout für Task {task_id}"
                         }))
-
         else:
             await websocket.send(json.dumps({"type": "error", "message": "Unbekannter Client-Typ"}))
     except websockets.exceptions.ConnectionClosed:
@@ -93,7 +85,6 @@ async def handler(websocket):
         logger.error(f"Error: {e}")
 
 async def cleanup_bots():
-    """Entfernt inaktive Bots regelmäßig aus dem Set."""
     while True:
         bot_ids = await r.smembers("active_bots")
         for bot_id in bot_ids:
@@ -107,7 +98,6 @@ async def cleanup_bots():
 async def main():
     global r
     r = redis.from_url(REDIS_URL, decode_responses=True)
-    # Starte Cleanup-Task
     asyncio.create_task(cleanup_bots())
 
     async with websockets.serve(handler, SERVER_HOST, SERVER_PORT):

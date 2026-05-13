@@ -5,12 +5,11 @@ import platform
 import psutil
 import time
 import logging
-import subprocess
 import shlex
 import os
 from dotenv import load_dotenv
 import redis.asyncio as redis
-from common.config import REDIS_URL, AUTH_TOKEN, MAX_COMMAND_TIMEOUT
+from common.config import REDIS_URL, MAX_COMMAND_TIMEOUT
 
 load_dotenv()
 
@@ -55,7 +54,6 @@ async def execute_command(cmd: str, timeout=MAX_COMMAND_TIMEOUT):
         return {"success": False, "error": str(e)}
 
 async def process_task(task: dict, r: redis.Redis):
-    """Verarbeitet eine einzelne Aufgabe und sendet das Ergebnis."""
     task_id = task["task_id"]
     action = task["action"]
     payload = task.get("payload")
@@ -89,45 +87,48 @@ async def process_task(task: dict, r: redis.Redis):
     else:
         result.update({"success": False, "error": f"Unbekannte Aktion: {action}"})
 
-    # Ergebnis in eigene Queue pro Task schreiben (damit der Server es gezielt abholen kann)
     await r.rpush(f"mesh:results:{task_id}", json.dumps(result))
-    # Optional: Expire setzen, damit die Queue nicht ewig wächst
     await r.expire(f"mesh:results:{task_id}", 120)
 
 async def heartbeat_loop(r: redis.Redis):
-    """Hält den Bot im active_bots Set und aktualisiert Heartbeat."""
+    tick = 0
     while True:
         await r.sadd("active_bots", bot_id)
         await r.set(f"bot:{bot_id}:heartbeat", time.time())
-        # Info nur alle 30 Sek. erneuern, um Redis nicht zu überlasten
-        if int(time.time()) % 30 == 0:
+        # FIX: Zähler statt Modulo-Zeit – Info alle 30s erneuern
+        if tick % 3 == 0:
             info = await get_system_info()
             await r.set(f"bot:{bot_id}:info", json.dumps(info))
+        tick += 1
         await asyncio.sleep(10)
 
 async def main():
     r = redis.from_url(REDIS_URL, decode_responses=True)
-    # Einfache Authentifizierung über Redis-Passwort (muss in REDIS_URL konfiguriert sein)
-    # Alternativ könnte man hier einen Token prüfen, aber Redis selbst bietet Auth.
     logger.info(f"Bot {bot_id} gestartet, verbinde mit Redis...")
 
-    # Heartbeat-Task starten
+    # FIX: Info sofort beim Start schreiben, damit Controller den Bot sieht
+    info = await get_system_info()
+    await r.set(f"bot:{bot_id}:info", json.dumps(info))
+    await r.sadd("active_bots", bot_id)
+    logger.info(f"Bot {bot_id} erfolgreich in Redis registriert.")
+
     heartbeat_task = asyncio.create_task(heartbeat_loop(r))
 
-    # Hauptschleife: Aufgaben aus Queue holen
     while True:
         try:
-            # Blockierend auf Aufgabe warten
-            _, task_raw = await r.blpop("mesh:tasks", timeout=10)
-            if task_raw is None:
+            logger.info("Warte auf Aufgaben...")
+            # FIX: None-Check vor dem Unpack
+            result = await r.blpop("mesh:tasks", timeout=10)
+            if result is None:
                 continue
+            _, task_raw = result
             task = json.loads(task_raw)
-            # Prüfen, ob Aufgabe für diesen Bot bestimmt ist (target: all oder spezifische ID)
             target = task.get("target", "all")
             if target == "all" or target == bot_id or target == bot_id.split('-')[0]:
+                logger.info(f"Verarbeite Task {task['task_id']} (Action: {task['action']})")
                 await process_task(task, r)
             else:
-                # Aufgabe nicht für uns – wieder in Queue legen (einfach hinten anstellen)
+                # Aufgabe nicht für uns – zurück in Queue
                 await r.rpush("mesh:tasks", task_raw)
         except asyncio.CancelledError:
             break

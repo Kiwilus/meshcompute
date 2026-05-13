@@ -1,5 +1,0 @@
-websockets
-redis
-python-dotenv
-psutil
-colorama

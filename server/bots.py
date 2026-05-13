@@ -1,1 +1,0 @@
-bots = {}  # bot_id -> {"ws": websocket, "info": dict, "last_seen": time}
