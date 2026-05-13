@@ -6,8 +6,8 @@ from colorama import init, Fore, Style
 
 init(autoreset=True)
 
-bots = {}  # verbundene Bots
-controllers = []  # verbundene Controller
+bots = {}  # connected Bots
+controllers = []  # connected Controller
 
 
 async def broadcast_to_bots(msg):
@@ -46,7 +46,7 @@ async def handler(websocket, path=None):
                 "last_seen": time.time(),
                 "info": data["info"]
             }
-            print(f"{Fore.GREEN}✅ Bot verbunden: {bot_id} | {hostname}{Style.RESET_ALL}")
+            print(f"{Fore.GREEN}Bot connected: {bot_id} | {hostname}{Style.RESET_ALL}")
 
             async for message in websocket:
                 msg = json.loads(message)
@@ -61,7 +61,7 @@ async def handler(websocket, path=None):
         # === Controller verbindet sich ===
         elif data.get("type") == "controller":
             controllers.append(websocket)
-            print(f"{Fore.MAGENTA}🖥️ Controller verbunden{Style.RESET_ALL}")
+            print(f"{Fore.MAGENTA}Controller connected{Style.RESET_ALL}")
 
             async for message in websocket:
                 msg = json.loads(message)
@@ -87,20 +87,20 @@ async def handler(websocket, path=None):
                         await broadcast_to_bots(msg)
 
     except Exception as e:
-        print(f"Fehler: {e}")
+        print(f"Error: {e}")
     finally:
         if websocket in controllers:
             controllers.remove(websocket)
         # Bot Cleanup
         for bid, info in list(bots.items()):
             if info["ws"] == websocket:
-                print(f"{Fore.RED}❌ Bot getrennt: {bid}{Style.RESET_ALL}")
+                print(f"{Fore.RED}❌ Bot disconnected: {bid}{Style.RESET_ALL}")
                 del bots[bid]
 
 
 async def main():
     async with websockets.serve(handler, "0.0.0.0", 8765):
-        print(f"{Fore.GREEN}🚀 VPS Relay Server läuft auf ws://0.0.0.0:8765{Style.RESET_ALL}")
+        print(f"{Fore.GREEN}VPS Relay Server runs on ws://0.0.0.0:8765{Style.RESET_ALL}")
         await asyncio.Future()
 
 
