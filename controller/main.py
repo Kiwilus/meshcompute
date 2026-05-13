@@ -20,7 +20,7 @@ class MeshController(cmd.Cmd):
     Tippe 'help' oder '?' für Befehle.
     ====================================={Style.RESET_ALL}
     """
-    prompt = f"{Fore.GREEN}meshctrl > {Style.RESET_ALL}"
+    prompt = f"\n{Fore.GREEN}meshctrl > {Style.RESET_ALL}"
 
     def __init__(self):
         super().__init__()
@@ -94,19 +94,49 @@ class MeshController(cmd.Cmd):
             async for message in self.ws:
                 data = json.loads(message)
 
-                if data["type"] == "result":
-                    bot_id = data.get("bot_id", "Unknown")
-                    if "output" in data:
-                        print(f"\n{Fore.YELLOW}[{bot_id}] Ausgabe:{Style.RESET_ALL}")
-                        print(data["output"])
-                    elif "error" in data and data["error"]:
-                        print(f"\n{Fore.RED}[{bot_id}] Fehler:{Style.RESET_ALL} {data['error']}")
-                    else:
-                        print(f"\n{Fore.CYAN}[{bot_id}] {data.get('message', str(data))}{Style.RESET_ALL}")
+                # === LIST Befehl (kommt direkt vom Server) ===
+                if data.get("type") == "result" and "bots" in data.get("data", {}):
+                    print(f"\n{Fore.CYAN}=== Verbundene Bots ({data['data']['count']}) ==={Style.RESET_ALL}")
+                    for bot in data["data"]["bots"]:
+                        status_color = Fore.GREEN if bot["status"] == "online" else Fore.RED
+                        print(f"   {status_color}{bot['bot_id']}{Style.RESET_ALL} | "
+                              f"{bot['hostname']} | "
+                              f"Offline seit: {bot['last_seen_sec']}s")
+                    continue
 
-                elif data["type"] == "bots":
-                    print(f"{Fore.CYAN}Verfügbare Bots: {len(data.get('data', {}).get('bots', []))}{Style.RESET_ALL}")
-        except:
+                # === Normale Bot Ergebnisse ===
+                if data.get("type") == "result":
+                    bot_id = data.get("bot_id", "Unknown")
+                    print(f"\n{Fore.YELLOW}=== Ausgabe von {bot_id} ==={Style.RESET_ALL}")
+
+                    if data.get("info"):  # sysinfo
+                        info = data["info"]
+                        print(f"{Fore.CYAN}System Information:{Style.RESET_ALL}")
+                        for key, value in info.items():
+                            if key != "bot_id":
+                                print(f"   {key:12}: {value}")
+
+                    elif data.get("output"):  # exec Befehle
+                        print(data["output"].strip() or "(keine Ausgabe)")
+
+                    elif data.get("processes"):  # ps Befehl
+                        print(f"{Fore.CYAN}Prozesse:{Style.RESET_ALL}")
+                        for p in data["processes"][:20]:
+                            print(f"   {p['pid']:6}  {p['name'][:35]:35}  CPU: {p.get('cpu', 0):.1f}%")
+
+                    elif data.get("success") is not None:
+                        if data.get("success"):
+                            print(f"{Fore.GREEN}Erfolg:{Style.RESET_ALL} {data.get('message', 'OK')}")
+                        else:
+                            print(f"{Fore.RED}Fehler:{Style.RESET_ALL} {data.get('error', 'Unbekannt')}")
+                    else:
+                        print(json.dumps(data, indent=2, ensure_ascii=False))
+
+                elif data.get("type") == "error":
+                    print(f"{Fore.RED}Fehler: {data.get('message')}{Style.RESET_ALL}")
+
+        except Exception as e:
+            print(f"\n{Fore.RED}Verbindung zum Server verloren.{Style.RESET_ALL}")
             self.connected = False
 
     # ==================== Befehle ====================
