@@ -3,40 +3,23 @@ import websockets
 import json
 import time
 import logging
+import redis.asyncio as redis
 from colorama import init, Fore, Style
-from common.config import SERVER_HOST, SERVER_PORT, AUTH_TOKEN
+from common.config import SERVER_HOST, SERVER_PORT, AUTH_TOKEN, REDIS_URL
 
 init(autoreset=True)
 
-# Logging
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
 
-bots = {}
-controllers = []
+# Redis-Client global (wird beim Start verbunden)
+r = None
 
 async def authenticate(data: dict) -> bool:
     return data.get("auth_token") == AUTH_TOKEN
 
-async def broadcast_to_bots(msg: dict):
-    target = msg.get("target", "all")
-    targets = list(bots.keys()) if target == "all" else [target] if target in bots else []
-
-    for bot_id in targets:
-        try:
-            await bots[bot_id]["ws"].send(json.dumps({
-                "type": "command",
-                "task_id": msg.get("task_id"),
-                "data": {
-                    "type": msg.get("action"),
-                    "payload": msg.get("payload")
-                }
-            }))
-        except Exception:
-            pass
-    return len(targets)
-
 async def handler(websocket):
+    """Behandelt Controller-Verbindungen. Bots verbinden sich direkt mit Redis."""
     try:
         first_msg = await websocket.recv()
         data = json.loads(first_msg)
@@ -47,66 +30,86 @@ async def handler(websocket):
 
         client_type = data.get("type")
 
-        if client_type == "register":
-            bot_id = data["bot_id"]
-            bots[bot_id] = {
-                "ws": websocket,
-                "hostname": data["info"].get("hostname", "Unknown"),
-                "last_seen": time.time(),
-                "info": data["info"]
-            }
-            logger.info(f"{Fore.GREEN}Bot connected: {bot_id} | {bots[bot_id]['hostname']}{Style.RESET_ALL}")
-
-            async for message in websocket:
-                msg = json.loads(message)
-                if msg["type"] == "result" or msg["type"] == "heartbeat":
-                    if msg["type"] == "heartbeat":
-                        if bot_id in bots:
-                            bots[bot_id]["last_seen"] = time.time()
-                        continue
-
-                    for ctrl in controllers[:]:
-                        try:
-                            await ctrl.send(json.dumps(msg))
-                        except:
-                            controllers.remove(ctrl) if ctrl in controllers else None
-
-        elif client_type == "controller":
-            controllers.append(websocket)
+        if client_type == "controller":
             logger.info(f"{Fore.MAGENTA}Controller connected{Style.RESET_ALL}")
-
+            # Controller-Schleife
             async for message in websocket:
                 msg = json.loads(message)
                 if msg["type"] == "command":
-                    if msg.get("action") == "list":
-                        bot_list = [
-                            {
-                                "bot_id": bid,
-                                "hostname": info["hostname"],
-                                "last_seen_sec": int(time.time() - info["last_seen"]),
-                                "status": "online" if time.time() - info["last_seen"] < 60 else "offline"
-                            }
-                            for bid, info in bots.items()
-                        ]
+                    action = msg.get("action")
+                    if action == "list":
+                        # Bots aus Redis holen (alle, die in den letzten 60 Sek. Heartbeat hatten)
+                        bot_ids = await r.smembers("active_bots")
+                        bot_list = []
+                        for bot_id in bot_ids:
+                            info_raw = await r.get(f"bot:{bot_id}:info")
+                            if info_raw:
+                                info = json.loads(info_raw)
+                                last_seen = float(await r.get(f"bot:{bot_id}:heartbeat") or 0)
+                                bot_list.append({
+                                    "bot_id": bot_id,
+                                    "hostname": info.get("hostname", "Unknown"),
+                                    "last_seen_sec": int(time.time() - last_seen),
+                                    "status": "online" if time.time() - last_seen < 60 else "offline"
+                                })
                         await websocket.send(json.dumps({
                             "type": "result",
-                            "data": {"bots": bot_list, "count": len(bots)}
+                            "data": {"bots": bot_list, "count": len(bot_list)}
                         }))
                     else:
-                        await broadcast_to_bots(msg)
+                        # Aufgabe in tasks-Queue legen
+                        task_id = msg.get("task_id", str(int(time.time()*1000)))
+                        task_data = {
+                            "task_id": task_id,
+                            "action": action,
+                            "target": msg.get("target", "all"),
+                            "payload": msg.get("payload")
+                        }
+                        await r.rpush("mesh:tasks", json.dumps(task_data))
+                        # Nicht warten, Ergebnis kommt asynchron
+                        # (Controller muss später Ergebnis abfragen – oder wir nutzen Pub/Sub)
+                        await websocket.send(json.dumps({
+                            "type": "info",
+                            "message": f"Task {task_id} queued."
+                        }))
+                elif msg["type"] == "get_result":
+                    task_id = msg.get("task_id")
+                    # Blockierend auf Ergebnis warten (30 s Timeout)
+                    result = await r.blpop(f"mesh:results:{task_id}", timeout=30)
+                    if result:
+                        _, payload = result
+                        await websocket.send(payload.decode())
+                    else:
+                        await websocket.send(json.dumps({
+                            "type": "error",
+                            "message": f"Timeout für Task {task_id}"
+                        }))
 
+        else:
+            await websocket.send(json.dumps({"type": "error", "message": "Unbekannter Client-Typ"}))
+    except websockets.exceptions.ConnectionClosed:
+        logger.info("Controller disconnected")
     except Exception as e:
         logger.error(f"Error: {e}")
-    finally:
-        # Cleanup
-        if websocket in controllers:
-            controllers.remove(websocket)
-        for bid, info in list(bots.items()):
-            if info["ws"] == websocket:
-                logger.info(f"{Fore.RED}Bot disconnected: {bid}{Style.RESET_ALL}")
-                del bots[bid]
+
+async def cleanup_bots():
+    """Entfernt inaktive Bots regelmäßig aus dem Set."""
+    while True:
+        bot_ids = await r.smembers("active_bots")
+        for bot_id in bot_ids:
+            last = await r.get(f"bot:{bot_id}:heartbeat")
+            if not last or time.time() - float(last) > 60:
+                await r.srem("active_bots", bot_id)
+                await r.delete(f"bot:{bot_id}:info")
+                await r.delete(f"bot:{bot_id}:heartbeat")
+        await asyncio.sleep(30)
 
 async def main():
+    global r
+    r = redis.from_url(REDIS_URL, decode_responses=True)
+    # Starte Cleanup-Task
+    asyncio.create_task(cleanup_bots())
+
     async with websockets.serve(handler, SERVER_HOST, SERVER_PORT):
         logger.info(f"{Fore.GREEN}MeshCompute Server running on ws://{SERVER_HOST}:{SERVER_PORT}{Style.RESET_ALL}")
         await asyncio.Future()
