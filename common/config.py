@@ -1,5 +1,8 @@
 import os
 import sys
+from dotenv import load_dotenv
+
+load_dotenv()
 
 AUTH_TOKEN = os.getenv("AUTH_TOKEN")
 if not AUTH_TOKEN:
