@@ -1,5 +1,5 @@
 .idea
 .venv
-server/__pycache__
-client/__pycache__
-ssh_botnet
+client/bot_id.txt
+uv.lock
+.env
