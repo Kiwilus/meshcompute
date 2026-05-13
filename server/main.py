@@ -2,79 +2,89 @@ import asyncio
 import websockets
 import json
 import time
+import logging
 from colorama import init, Fore, Style
+from common.config import SERVER_HOST, SERVER_PORT, AUTH_TOKEN
 
 init(autoreset=True)
 
-bots = {}  # connected Bots
-controllers = []  # connected Controller
+# Logging
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
+logger = logging.getLogger(__name__)
 
+bots = {}
+controllers = []
 
-async def broadcast_to_bots(msg):
+async def authenticate(data: dict) -> bool:
+    return data.get("auth_token") == AUTH_TOKEN
+
+async def broadcast_to_bots(msg: dict):
     target = msg.get("target", "all")
     targets = list(bots.keys()) if target == "all" else [target] if target in bots else []
-
-    task_id = msg.get("task_id")
 
     for bot_id in targets:
         try:
             await bots[bot_id]["ws"].send(json.dumps({
                 "type": "command",
-                "task_id": task_id,
+                "task_id": msg.get("task_id"),
                 "data": {
                     "type": msg.get("action"),
                     "payload": msg.get("payload")
                 }
             }))
-        except:
+        except Exception:
             pass
     return len(targets)
 
-
-async def handler(websocket, path=None):
+async def handler(websocket):
     try:
         first_msg = await websocket.recv()
         data = json.loads(first_msg)
 
-        # === Bot verbindet sich ===
-        if data.get("type") == "register":
+        if not await authenticate(data):
+            await websocket.send(json.dumps({"type": "error", "message": "Authentication failed"}))
+            return
+
+        client_type = data.get("type")
+
+        if client_type == "register":
             bot_id = data["bot_id"]
-            hostname = data["info"].get("hostname", "Unknown")
             bots[bot_id] = {
                 "ws": websocket,
-                "hostname": hostname,
+                "hostname": data["info"].get("hostname", "Unknown"),
                 "last_seen": time.time(),
                 "info": data["info"]
             }
-            print(f"{Fore.GREEN}Bot connected: {bot_id} | {hostname}{Style.RESET_ALL}")
+            logger.info(f"{Fore.GREEN}Bot connected: {bot_id} | {bots[bot_id]['hostname']}{Style.RESET_ALL}")
 
             async for message in websocket:
                 msg = json.loads(message)
-                if msg["type"] == "result":
+                if msg["type"] == "result" or msg["type"] == "heartbeat":
+                    if msg["type"] == "heartbeat":
+                        if bot_id in bots:
+                            bots[bot_id]["last_seen"] = time.time()
+                        continue
+
                     for ctrl in controllers[:]:
                         try:
                             await ctrl.send(json.dumps(msg))
                         except:
-                            if ctrl in controllers:
-                                controllers.remove(ctrl)
+                            controllers.remove(ctrl) if ctrl in controllers else None
 
-        # === Controller verbindet sich ===
-        elif data.get("type") == "controller":
+        elif client_type == "controller":
             controllers.append(websocket)
-            print(f"{Fore.MAGENTA}Controller connected{Style.RESET_ALL}")
+            logger.info(f"{Fore.MAGENTA}Controller connected{Style.RESET_ALL}")
 
             async for message in websocket:
                 msg = json.loads(message)
                 if msg["type"] == "command":
-                    action = msg.get("action")
-
-                    if action == "list":
-                        # Sofortige Antwort mit Bot-Liste
+                    if msg.get("action") == "list":
                         bot_list = [
                             {
                                 "bot_id": bid,
                                 "hostname": info["hostname"],
-                                "last_seen": int(time.time() - info["last_seen"])
+                                "last_seen_sec": int(time.time() - info["last_seen"]),
+                                "status": "online" if time.time() - info["last_seen"] < 60 else "offline"
                             }
                             for bid, info in bots.items()
                         ]
@@ -83,26 +93,23 @@ async def handler(websocket, path=None):
                             "data": {"bots": bot_list, "count": len(bots)}
                         }))
                     else:
-                        # Normale Befehle an Bots weiterleiten
                         await broadcast_to_bots(msg)
 
     except Exception as e:
-        print(f"Error: {e}")
+        logger.error(f"Error: {e}")
     finally:
+        # Cleanup
         if websocket in controllers:
             controllers.remove(websocket)
-        # Bot Cleanup
         for bid, info in list(bots.items()):
             if info["ws"] == websocket:
-                print(f"{Fore.RED}❌ Bot disconnected: {bid}{Style.RESET_ALL}")
+                logger.info(f"{Fore.RED}Bot disconnected: {bid}{Style.RESET_ALL}")
                 del bots[bid]
 
-
 async def main():
-    async with websockets.serve(handler, "0.0.0.0", 8765):
-        print(f"{Fore.GREEN}VPS Relay Server runs on ws://0.0.0.0:8765{Style.RESET_ALL}")
+    async with websockets.serve(handler, SERVER_HOST, SERVER_PORT):
+        logger.info(f"{Fore.GREEN}MeshCompute Server running on ws://{SERVER_HOST}:{SERVER_PORT}{Style.RESET_ALL}")
         await asyncio.Future()
-
 
 if __name__ == "__main__":
     asyncio.run(main())
