@@ -1,0 +1,33 @@
+version: '3.8'
+
+services:
+  redis:
+    image: redis:7-alpine
+    command: redis-server --requirepass ${REDIS_PASSWORD:-redis_geheim}
+    networks:
+      - meshnet
+    volumes:
+      - redis_data:/data
+
+  server:
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile
+    environment:
+      AUTH_TOKEN: ${AUTH_TOKEN}
+      BOT_SECRETS: ${BOT_SECRETS}
+      REDIS_URL: redis:6379
+      REDIS_PASSWORD: ${REDIS_PASSWORD:-redis_geheim}
+      SERVER_PORT: "8080"
+    ports:
+      - "${SERVER_PORT:-8080}:8080"
+    networks:
+      - meshnet
+    depends_on:
+      - redis
+
+volumes:
+  redis_data:
+
+networks:
+  meshnet:
