@@ -2,107 +2,146 @@ import asyncio
 import websockets
 import json
 import time
-import logging
 import redis.asyncio as redis
-from colorama import init, Fore, Style
-from common.config import SERVER_HOST, SERVER_PORT, AUTH_TOKEN, REDIS_URL
-
-init(autoreset=True)
+import logging
+from common.config import AUTH_TOKEN, REDIS_URL
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
-logger = logging.getLogger(__name__)
 
-r = None
+class MeshServer:
+    def __init__(self):
+        self.clients = {}          # ws -> bot_info
+        self.controllers = set()
+        self.redis = None
 
-async def authenticate(data: dict) -> bool:
-    return data.get("auth_token") == AUTH_TOKEN
+    async def get_redis(self):
+        if not self.redis:
+            self.redis = redis.from_url(REDIS_URL, decode_responses=True)
+        return self.redis
 
-async def handler(websocket):
-    try:
-        first_msg = await websocket.recv()
-        data = json.loads(first_msg)
+    async def register_client(self, ws, bot_id: str):
+        self.clients[ws] = {
+            "bot_id": bot_id or f"bot_{int(time.time())}",
+            "hostname": "unknown",
+            "last_seen": time.time(),
+            "status": "online"
+        }
+        logging.info(f"✅ Client registriert: {bot_id}")
 
-        if not await authenticate(data):
-            await websocket.send(json.dumps({"type": "error", "message": "Authentication failed"}))
-            return
+    async def remove_client(self, ws):
+        if ws in self.clients:
+            bot_id = self.clients[ws]["bot_id"]
+            del self.clients[ws]
+            logging.info(f"❌ Client disconnected: {bot_id}")
 
-        client_type = data.get("type")
+    async def broadcast_task(self, task: dict, target="all"):
+        r = await self.get_redis()
+        count = 0
+        for ws, info in list(self.clients.items()):
+            if target == "all" or info["bot_id"] == target:
+                try:
+                    await r.rpush("mesh:tasks", json.dumps(task))
+                    count += 1
+                except Exception as e:
+                    logging.error(f"Failed to queue task to {info['bot_id']}: {e}")
+        return count
 
-        if client_type == "controller":
-            logger.info(f"{Fore.MAGENTA}Controller connected{Style.RESET_ALL}")
-            async for message in websocket:
-                msg = json.loads(message)
-                if msg["type"] == "command":
-                    action = msg.get("action")
-                    if action == "list":
-                        bot_ids = await r.smembers("active_bots")
-                        bot_list = []
-                        for bot_id in bot_ids:
-                            info_raw = await r.get(f"bot:{bot_id}:info")
-                            if info_raw:
-                                info = json.loads(info_raw)
-                                last_seen = float(await r.get(f"bot:{bot_id}:heartbeat") or 0)
-                                bot_list.append({
-                                    "bot_id": bot_id,
-                                    "hostname": info.get("hostname", "Unknown"),
-                                    "last_seen_sec": int(time.time() - last_seen),
-                                    "status": "online" if time.time() - last_seen < 60 else "offline"
-                                })
-                        await websocket.send(json.dumps({
+    async def handler(self, ws):
+        """Einheitlicher Handler für alle Verbindungen"""
+        try:
+            # Erste Nachricht (Auth + Type)
+            init_msg = await asyncio.wait_for(ws.recv(), timeout=10.0)
+            data = json.loads(init_msg)
+
+            if data.get("type") == "controller" and data.get("auth_token") == AUTH_TOKEN:
+                logging.info("Controller verbunden")
+                self.controllers.add(ws)
+                await self.handle_controller(ws)
+
+            elif data.get("type") == "client":
+                bot_id = data.get("bot_id")
+                await self.register_client(ws, bot_id)
+                await self.handle_client(ws)
+
+            else:
+                await ws.close(reason="Invalid connection type")
+
+        except asyncio.TimeoutError:
+            logging.warning("Timeout beim Verbindungsaufbau")
+        except Exception as e:
+            logging.error(f"Handler Error: {e}")
+        finally:
+            if ws in self.clients:
+                await self.remove_client(ws)
+            if ws in self.controllers:
+                self.controllers.discard(ws)
+
+    async def handle_client(self, ws):
+        """Persistente Client Verbindung mit Heartbeat"""
+        try:
+            while True:
+                msg = await ws.recv()
+                data = json.loads(msg)
+
+                if data["type"] == "heartbeat":
+                    if ws in self.clients:
+                        self.clients[ws]["last_seen"] = time.time()
+        except Exception:
+            pass  # Verbindung wird in finally geschlossen
+
+    async def handle_controller(self, ws):
+        """Persistente Controller Verbindung"""
+        try:
+            while True:
+                msg = await ws.recv()
+                data = json.loads(msg)
+
+                if data.get("type") == "command":
+                    task_id = data.get("task_id", f"task_{int(time.time())}")
+                    command = {
+                        "task_id": task_id,
+                        "action": data["action"],
+                        "target": data.get("target", "all"),
+                        "payload": data.get("payload")
+                    }
+
+                    if data["action"] == "list":
+                        bots = [{
+                            "bot_id": info["bot_id"],
+                            "hostname": info.get("hostname", "unknown"),
+                            "status": info["status"],
+                            "last_seen_sec": int(time.time() - info["last_seen"])
+                        } for info in self.clients.values()]
+
+                        await ws.send(json.dumps({
                             "type": "result",
-                            "data": {"bots": bot_list, "count": len(bot_list)}
+                            "data": {"bots": bots, "count": len(bots)}
                         }))
                     else:
-                        task_id = msg.get("task_id", str(int(time.time() * 1000)))
-                        task_data = {
-                            "task_id": task_id,
-                            "action": action,
-                            "target": msg.get("target", "all"),
-                            "payload": msg.get("payload")
-                        }
-                        await r.rpush("mesh:tasks", json.dumps(task_data))
-                        await websocket.send(json.dumps({
+                        # Task an Redis Queue
+                        sent = await self.broadcast_task(command, data.get("target", "all"))
+                        await ws.send(json.dumps({
                             "type": "info",
-                            "message": f"Task {task_id} queued."
+                            "message": f"Task {task_id} an {sent} Client(s) queued."
                         }))
-                elif msg["type"] == "get_result":
-                    task_id = msg.get("task_id")
-                    result = await r.blpop(f"mesh:results:{task_id}", timeout=30)
-                    if result:
-                        _, payload = result
-                        # FIX: decode_responses=True → payload ist bereits str, kein .decode() nötig
-                        await websocket.send(payload)
+
+                elif data.get("type") == "get_result":
+                    r = await self.get_redis()
+                    result_json = await r.lpop(f"mesh:results:{data['task_id']}")
+                    if result_json:
+                        await ws.send(result_json)
                     else:
-                        await websocket.send(json.dumps({
-                            "type": "error",
-                            "message": f"Timeout für Task {task_id}"
-                        }))
-        else:
-            await websocket.send(json.dumps({"type": "error", "message": "Unbekannter Client-Typ"}))
-    except websockets.exceptions.ConnectionClosed:
-        logger.info("Controller disconnected")
-    except Exception as e:
-        logger.error(f"Error: {e}")
+                        await ws.send(json.dumps({"type": "info", "message": "Result not ready yet"}))
 
-async def cleanup_bots():
-    while True:
-        bot_ids = await r.smembers("active_bots")
-        for bot_id in bot_ids:
-            last = await r.get(f"bot:{bot_id}:heartbeat")
-            if not last or time.time() - float(last) > 60:
-                await r.srem("active_bots", bot_id)
-                await r.delete(f"bot:{bot_id}:info")
-                await r.delete(f"bot:{bot_id}:heartbeat")
-        await asyncio.sleep(30)
+        except Exception as e:
+            logging.error(f"Controller connection error: {e}")
 
-async def main():
-    global r
-    r = redis.from_url(REDIS_URL, decode_responses=True)
-    asyncio.create_task(cleanup_bots())
+    async def main(self):
+        print("🚀 MeshCompute Server (Redis + WebSocket) gestartet")
+        async with websockets.serve(self.handler, "0.0.0.0", 8765):
+            await asyncio.Future()  # läuft ewig
 
-    async with websockets.serve(handler, SERVER_HOST, SERVER_PORT):
-        logger.info(f"{Fore.GREEN}MeshCompute Server running on ws://{SERVER_HOST}:{SERVER_PORT}{Style.RESET_ALL}")
-        await asyncio.Future()
 
 if __name__ == "__main__":
-    asyncio.run(main())
+    server = MeshServer()
+    asyncio.run(server.main())
