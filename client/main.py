@@ -31,62 +31,6 @@ async def get_system_info():
         "pid": os.getpid()
     }
 
-r = None
-
-async def execute_task(task_data: dict):
-    """Führt eine Task aus und pusht Ergebnis zurück."""
-    task_id = task_data["task_id"]
-    action = task_data.get("action")
-    payload = task_data.get("payload")
-
-    result = {"task_id": task_id, "success": True, "output": "", "error": None}
-
-    try:
-        if action == "exec":
-            output = subprocess.check_output(payload, shell=True, timeout=30, text=True)
-            result["output"] = output
-        elif action == "python":
-            # Sicherer Exec (besser später sandboxen)
-            local = {}
-            exec(payload, {"__builtins__": {}}, local)
-            result["output"] = str(local.get('result', 'OK'))
-        elif action == "sysinfo":
-            result["info"] = {
-                "cpu": psutil.cpu_percent(),
-                "memory": psutil.virtual_memory().percent,
-                "hostname": psutil.os.uname().nodename,
-                "bot_id": ...  # aus bot_id.txt laden
-            }
-        # TODO: Neue Actions wie "upload", "download", "llm_chunk" hinzufügen
-        else:
-            result["success"] = False
-            result["error"] = f"Unbekannte Action: {action}"
-    except Exception as e:
-        result["success"] = False
-        result["error"] = str(e)
-
-    # Ergebnis in Redis speichern
-    await r.rpush(f"mesh:results:{task_id}", json.dumps(result))
-    await r.expire(f"mesh:results:{task_id}", 300)  # 5 Min TTL
-
-
-async def task_consumer():
-    """Holt Tasks aus Redis Queue"""
-    global r
-    r = redis.from_url(REDIS_URL, decode_responses=True)
-
-    while True:
-        try:
-            task = await r.blpop("mesh:tasks", timeout=5)
-            if task:
-                _, task_json = task
-                task_data = json.loads(task_json)
-                asyncio.create_task(execute_task(task_data))
-        except Exception as e:
-            print(f"Task Consumer Error: {e}")
-            await asyncio.sleep(1)
-
-
 async def execute_command(cmd: str, timeout=MAX_COMMAND_TIMEOUT):
     try:
         args = shlex.split(cmd)
