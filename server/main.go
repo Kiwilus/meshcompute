@@ -1,7 +1,11 @@
+// server/main.go
 package main
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
+	"encoding/json"
 	"fmt"
 	"log"
 	"net/http"
@@ -16,9 +20,12 @@ import (
 )
 
 var (
-	authToken  string
-	redisAddr  string
-	serverPort = ":8080"
+	authTokenHash string
+	redisAddr     string
+	redisPassword string
+	serverPort    = ":8080"
+	botSecrets    map[string]string // bot_id -> secret
+	botAuthOn     bool
 )
 
 type Client struct {
@@ -42,8 +49,26 @@ var (
 )
 
 func main() {
-	authToken = getEnv("AUTH_TOKEN", "change_me_please_secure_token_123")
+	// --- Controller-Token ---
+	token := getEnv("AUTH_TOKEN", "change_me_please_secure_token_123")
+	authTokenHash = hashString(token)
+
+	// --- Redis ---
 	redisAddr = getEnv("REDIS_URL", "localhost:6379")
+	redisPassword = getEnv("REDIS_PASSWORD", "")
+
+	// --- Bot-Authentifizierung ---
+	secretsJSON := os.Getenv("BOT_SECRETS")
+	if secretsJSON != "" {
+		if err := json.Unmarshal([]byte(secretsJSON), &botSecrets); err != nil {
+			log.Fatalf("Fehler beim Parsen von BOT_SECRETS: %v", err)
+		}
+		botAuthOn = true
+		log.Println("Bot-Authentifizierung AKTIVIERT")
+	} else {
+		log.Println("Warnung: Keine BOT_SECRETS gesetzt – Bots werden ohne Authentifizierung akzeptiert")
+	}
+
 	serverPort = ":" + getEnv("SERVER_PORT", "8080")
 
 	hub = &Hub{
@@ -51,14 +76,15 @@ func main() {
 		register:   make(chan *Client),
 		unregister: make(chan *Client),
 		redis: redis.NewClient(&redis.Options{
-			Addr:       redisAddr,
+			Addr:     redisAddr,
+			Password: redisPassword,
 			MaxRetries: 5,
 		}),
 	}
 
 	// Redis-Verbindung testen
 	if _, err := hub.redis.Ping(context.Background()).Result(); err != nil {
-		log.Printf("Warning: Redis is not reachable: %v", err)
+		log.Printf("Warnung: Redis nicht erreichbar: %v", err)
 	}
 
 	go hub.run()
@@ -66,8 +92,14 @@ func main() {
 
 	http.HandleFunc("/ws", handleWebSocket)
 
-	log.Printf("MeshCompute Server running on ws://0.0.0.0%s", serverPort)
-	log.Fatal(http.ListenAndServe(serverPort, nil))
+	// Optional: TLS aktivieren wenn Zertifikate vorhanden
+	if os.Getenv("TLS_CERT") != "" && os.Getenv("TLS_KEY") != "" {
+		log.Printf("MeshCompute Server läuft auf wss://0.0.0.0%s", serverPort)
+		log.Fatal(http.ListenAndServeTLS(serverPort, os.Getenv("TLS_CERT"), os.Getenv("TLS_KEY"), nil))
+	} else {
+		log.Printf("MeshCompute Server läuft auf ws://0.0.0.0%s", serverPort)
+		log.Fatal(http.ListenAndServe(serverPort, nil))
+	}
 }
 
 func getEnv(key, fallback string) string {
@@ -77,10 +109,15 @@ func getEnv(key, fallback string) string {
 	return fallback
 }
 
+func hashString(s string) string {
+	h := sha256.Sum256([]byte(s))
+	return hex.EncodeToString(h[:])
+}
+
 func handleWebSocket(w http.ResponseWriter, r *http.Request) {
 	c, err := websocket.Accept(w, r, nil)
 	if err != nil {
-		log.Println("WebSocket accept error:", err)
+		log.Println("WebSocket Accept Fehler:", err)
 		return
 	}
 	client := &Client{conn: c, ctx: context.Background()}
@@ -99,12 +136,10 @@ func (h *Hub) run() {
 			h.mu.Lock()
 			delete(h.clients, client.id)
 			h.mu.Unlock()
-			// Clean up Redis entries for bots
 			if client.typ == "client" {
 				ctx := context.Background()
 				h.redis.SRem(ctx, "active_bots", client.id)
 				h.redis.Del(ctx, "bot:"+client.id)
-				// Remove related shell sessions
 				shellSessions.Range(func(key, value interface{}) bool {
 					if value.(string) == client.id {
 						shellSessions.Delete(key)
@@ -129,19 +164,28 @@ func handleClient(c *Client) {
 		Type      string `json:"type"`
 		AuthToken string `json:"auth_token,omitempty"`
 		BotID     string `json:"bot_id,omitempty"`
+		BotSecret string `json:"bot_secret,omitempty"`
 	}
 	if err := wsjson.Read(c.ctx, c.conn, &initMsg); err != nil {
 		return
 	}
 
 	if initMsg.Type == "controller" {
-		if initMsg.AuthToken != authToken {
+		if hashString(initMsg.AuthToken) != authTokenHash {
 			log.Println("❌ Falscher Auth Token")
 			return
 		}
 		c.typ = "controller"
 		c.id = "ctrl_" + fmt.Sprint(time.Now().UnixNano())
 	} else if initMsg.Type == "client" && initMsg.BotID != "" {
+		// Bot-Authentifizierung, wenn aktiv
+		if botAuthOn {
+			expectedSecret, exists := botSecrets[initMsg.BotID]
+			if !exists || initMsg.BotSecret != expectedSecret {
+				log.Printf("❌ Bot-Authentifizierung fehlgeschlagen für %s", initMsg.BotID)
+				return
+			}
+		}
 		c.typ = "client"
 		c.id = initMsg.BotID
 		ctx := context.Background()
@@ -180,17 +224,15 @@ func (h *Hub) handleMessage(sender *Client, msg map[string]interface{}) {
 	case "shell_output", "shell_exit", "file_upload_done", "result":
 		h.forwardToController(sender, msg)
 	case "shell_input":
-		// Forward shell input to the appropriate client
 		h.forwardToClient(sender, msg)
 	default:
-		// Unknown Type - > for security on controllers
 		h.forwardToController(sender, msg)
 	}
 }
 
 func (h *Hub) handleControllerCommand(sender *Client, msg map[string]interface{}) {
 	action := fmt.Sprintf("%v", msg["action"])
-	taskID := fmt.Sprintf("%v", msg["task_id"]) // Get task_id out of the message
+	taskID := fmt.Sprintf("%v", msg["task_id"])
 
 	if action == "list" {
 		h.sendBotList(sender, taskID)
@@ -204,7 +246,6 @@ func (h *Hub) handleControllerCommand(sender *Client, msg map[string]interface{}
 		h.handleUpload(sender, msg, taskID)
 		return
 	}
-	// all other commands (exec, sysinfo, python, ps, ping)
 	h.broadcastCommand(msg)
 }
 
@@ -222,7 +263,7 @@ func (h *Hub) sendBotList(controller *Client, taskID string) {
 	}
 	response := map[string]interface{}{
 		"type":    "result",
-		"task_id": taskID, // now with task_id
+		"task_id": taskID,
 		"data": map[string]interface{}{
 			"bots": bots,
 		},
@@ -267,7 +308,6 @@ func (h *Hub) handleUpload(controller *Client, msg map[string]interface{}, taskI
 		}
 	}
 	h.mu.RUnlock()
-	// Bestätigung mit task_id zurück an den Controller
 	wsjson.Write(controller.ctx, controller.conn, map[string]interface{}{
 		"type":    "info",
 		"task_id": taskID,
@@ -334,7 +374,6 @@ func (h *Hub) cleanupInactiveBots() {
 					h.redis.Del(context.Background(), "bot:"+id)
 					delete(h.clients, id)
 					client.conn.Close(websocket.StatusNormalClosure, "heartbeat timeout")
-					// Zugehörige Shell-Sessions aufräumen
 					shellSessions.Range(func(key, value interface{}) bool {
 						if value.(string) == id {
 							shellSessions.Delete(key)
