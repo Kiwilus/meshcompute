@@ -101,33 +101,50 @@ class MeshServer:
                     task_id = data.get("task_id", f"task_{int(time.time())}")
 
                     if action == "list":
-                        # NEU: Aus Redis lesen statt nur self.clients
                         r = await self.get_redis()
                         bot_ids = await r.smembers("active_bots")
+                        current_time = time.time()
+                        active_bots = []
+                        to_remove = []
 
-                        bots = []
-                        for bid in bot_ids:
+                        for bid in list(bot_ids):
                             info_raw = await r.get(f"bot:{bid}:info")
-                            last_heartbeat = await r.get(f"bot:{bid}:heartbeat")
+                            heartbeat_raw = await r.get(f"bot:{bid}:heartbeat")
 
-                            if info_raw:
-                                try:
-                                    info = json.loads(info_raw)
-                                    last_seen = int(time.time() - float(last_heartbeat or 0))
-                                    bots.append({
-                                        "bot_id": bid,
-                                        "hostname": info.get("hostname", "unknown"),
-                                        "status": "online" if last_seen < 60 else "offline",
-                                        "last_seen_sec": last_seen,
-                                        "cpu": info.get("cpu"),
-                                        "memory_gb": info.get("memory_gb")
-                                    })
-                                except:
-                                    pass
+                            if not info_raw or not heartbeat_raw:
+                                to_remove.append(bid)
+                                continue
+
+                            try:
+                                info = json.loads(info_raw)
+                                last_heartbeat = float(heartbeat_raw)
+                                last_seen_sec = int(current_time - last_heartbeat)
+
+                                # Als offline markieren wenn älter als 90 Sekunden
+                                status = "online" if last_seen_sec < 90 else "offline"
+
+                                if last_seen_sec > 300:  # älter als 5 Minuten → komplett löschen
+                                    to_remove.append(bid)
+                                    continue
+
+                                active_bots.append({
+                                    "bot_id": bid,
+                                    "hostname": info.get("hostname", "unknown"),
+                                    "status": status,
+                                    "last_seen_sec": last_seen_sec,
+                                    "cpu": info.get("cpu"),
+                                    "memory_gb": info.get("memory_gb")
+                                })
+                            except:
+                                to_remove.append(bid)
+
+                        # Aufräumen
+                        if to_remove:
+                            await r.srem("active_bots", *to_remove)
 
                         await ws.send(json.dumps({
                             "type": "result",
-                            "data": {"bots": bots, "count": len(bots)}
+                            "data": {"bots": active_bots, "count": len(active_bots)}
                         }))
 
                     else:
