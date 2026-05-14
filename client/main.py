@@ -87,8 +87,9 @@ async def process_task(task: dict, r: redis.Redis):
     else:
         result.update({"success": False, "error": f"Unbekannte Aktion: {action}"})
 
-    await r.rpush(f"mesh:results:{task_id}", json.dumps(result))
-    await r.expire(f"mesh:results:{task_id}", 120)
+    result_key = f"mesh:results:{task_id}"
+    await r.rpush(result_key, json.dumps(result))
+    await r.expire(result_key, 300)
 
 async def heartbeat_loop(r: redis.Redis):
     tick = 0
@@ -102,41 +103,59 @@ async def heartbeat_loop(r: redis.Redis):
         tick += 1
         await asyncio.sleep(10)
 
-async def main():
-    r = redis.from_url(REDIS_URL, decode_responses=True)
-    logger.info(f"Bot {bot_id} gestartet, verbinde mit Redis...")
 
-    # FIX: Info sofort beim Start schreiben, damit Controller den Bot sieht
-    info = await get_system_info()
-    await r.set(f"bot:{bot_id}:info", json.dumps(info))
-    await r.sadd("active_bots", bot_id)
-    logger.info(f"Bot {bot_id} erfolgreich in Redis registriert.")
-
-    heartbeat_task = asyncio.create_task(heartbeat_loop(r))
-
+async def create_robust_redis():
     while True:
         try:
-            logger.info("Warte auf Aufgaben...")
-            # FIX: None-Check vor dem Unpack
-            result = await r.blpop("mesh:tasks", timeout=10)
-            if result is None:
-                continue
-            _, task_raw = result
-            task = json.loads(task_raw)
-            target = task.get("target", "all")
-            if target == "all" or target == bot_id or target == bot_id.split('-')[0]:
-                logger.info(f"Verarbeite Task {task['task_id']} (Action: {task['action']})")
-                await process_task(task, r)
-            else:
-                # Aufgabe nicht für uns – zurück in Queue
-                await r.rpush("mesh:tasks", task_raw)
+            r = redis.from_url(REDIS_URL, decode_responses=True, socket_connect_timeout=10, socket_timeout=15)
+            await r.ping()
+            logger.info("Redis verbunden")
+            return r
+        except Exception as e:
+            logger.error(f"Redis Verbindungsfehler: {e}. Warte 3s...")
+            await asyncio.sleep(3)
+
+
+async def main():
+    while True:  # Outer reconnect loop
+        r = None
+        try:
+            r = await create_robust_redis()
+
+            # Initial registration
+            info = await get_system_info()
+            await r.set(f"bot:{bot_id}:info", json.dumps(info), ex=120)
+            await r.sadd("active_bots", bot_id)
+
+            heartbeat_task = asyncio.create_task(heartbeat_loop(r))
+
+            while True:
+                try:
+                    result = await r.blpop("mesh:tasks", timeout=15)
+                    if result is None:
+                        continue
+
+                    _, task_raw = result
+                    task = json.loads(task_raw)
+
+                    target = task.get("target", "all")
+                    if target in ("all", bot_id, bot_id.split('-')[0]):
+                        logger.info(f"Task {task['task_id']} bearbeitet")
+                        await process_task(task, r)
+                    else:
+                        await r.rpush("mesh:tasks", task_raw)  # zurück in Queue
+                except Exception as e:
+                    logger.error(f"Task Loop Error: {e}")
+                    await asyncio.sleep(2)
+
         except asyncio.CancelledError:
             break
         except Exception as e:
-            logger.error(f"Fehler in Hauptschleife: {e}")
+            logger.error(f"Schwerer Fehler im Main-Loop: {e}")
             await asyncio.sleep(5)
-
-    heartbeat_task.cancel()
+        finally:
+            if r:
+                await r.close()
 
 if __name__ == "__main__":
     print(f"MeshCompute Client gestartet → {bot_id}")
