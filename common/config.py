@@ -6,7 +6,7 @@ load_dotenv()
 
 AUTH_TOKEN = os.getenv("AUTH_TOKEN")
 if not AUTH_TOKEN:
-    print("❌ FATAL: AUTH_TOKEN nicht gesetzt.", file=sys.stderr)
+    print("❌ FATAL: AUTH_TOKEN not set.", file=sys.stderr)
     sys.exit(1)
 
 SERVER_HOST = os.getenv("SERVER_HOST", "0.0.0.0")
