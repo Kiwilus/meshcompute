@@ -42,8 +42,15 @@ class MeshController:
     async def connect(self):
         try:
             # Verwende wss:// wenn TLS in der URL gesetzt ist (SERVER_URL konfigurierbar)
+            import ssl
+            ssl_context = ssl.create_default_context()
+            ssl_context.check_hostname = False
+            ssl_context.verify_mode = ssl.CERT_NONE
             self.ws = await websockets.connect(
-                SERVER_URL, ping_interval=20, ping_timeout=40
+                SERVER_URL,
+                ssl=ssl_context,
+                ping_interval=20,
+                ping_timeout=40
             )
             await self.ws.send(
                 json.dumps({"type": "controller", "auth_token": AUTH_TOKEN})

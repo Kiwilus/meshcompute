@@ -22,145 +22,60 @@ Commands, interactive shells, file uploads, and system information – secured b
 
 ---
 
+# MeshCompute – Secure Lightweight Bot Network
+
+MeshCompute is a Go-based WebSocket relay server that connects a **Controller** (Python CLI) to multiple **Bots** (Python, compilable to EXE or APK).  
+Commands, interactive shells, file uploads, and system information – secured by bot authentication, token hashing, and TLS encryption.
+
+---
+
 # Features
 
-- **Controller** ↔ **Server** ↔ **Many Bots** over WebSocket
-- Interactive shell
-- Remote command execution
-- System information & process listing
-- Ping / pong connectivity checks
-- Python code execution on bots
-- File upload to individual bots or all bots
-- Bot authentication via shared secrets
-- Controller token hashing (SHA-256)
-- Redis backend for presence + heartbeats
-- Password-protected Redis
-- Optional TLS encryption (`wss://`)
-- Self-signed certificates included
-- Let's Encrypt compatible
-- EXE build support (Windows)
-- APK build support (Android)
-- Fully Dockerized deployment
-- Automated setup scripts
-- Zero manual configuration
+- **Controller** ↔ **Server** ↔ **Bots** over WebSocket (WSS)
+- Interactive shell, remote command execution, system info, process list, ping, Python code execution
+- File upload to single bots or all at once
+- Bot authentication via pre-shared secrets
+- Controller token hashed (SHA-256) on the server
+- Redis backend for bot presence and heartbeats (password-protected)
+- Automatic TLS encryption (self-signed or Let's Encrypt ready)
+- Ready-to-build EXE (Windows) and APK (Android) with external JSON config
+- Fully Dockerized server with one-command deployment
+- **Zero manual configuration** – three setup scripts do everything
 
 ---
 
-# Architecture Overview
-
-```text
-        Controller
-     (Python CLI)
-            │
-            │  wss://
-            ▼
-     ┌───────────────┐
-     │   Go Server   │
-     │ + Redis Cache │
-     └───────────────┘
-            │
-            │  wss://
-            ▼
-        Bot(s)
- (Python / EXE / APK)
-```
-
-Authentication flow:
-
-```text
-Controller ---> AUTH_TOKEN ---> Server
-Bot ---------> BOT_SECRET ----> Server
-```
-
----
-
-# Quick Start
-
-If you want to test MeshCompute locally without TLS:
-
-## 1. Clone the repository
+# Quick Start (local test without Docker)
 
 ```bash
 git clone https://github.com/Kiwilus/meshcompute.git
 cd meshcompute
-```
 
-## 2. Generate secrets
+# 1. Run server & Redis with Docker
+cd docker && docker compose up -d
 
-```bash
-python3 builder/generate_secrets.py
-```
-
-This creates:
-
-- `.env`
-- Bot configuration files
-- Random authentication secrets
-
----
-
-## 3. Start server + Redis
-
-```bash
-cd docker
-docker compose up -d
-```
-
----
-
-## 4. Start a bot
-
-Use one of the generated bot secrets:
-
-```bash
+# 2. Start a bot (replace with your server's secret)
 export BOT_SECRET="<secret_for_bot01>"
 python3 client/main.py
-```
 
----
-
-## 5. Start the controller
-
-```bash
+# 3. Start the controller
+export AUTH_TOKEN="<your_token>"
+export SERVER_URL="ws://localhost:8080/ws"
 python3 controller/main.py
 ```
 
-At the prompt:
-
-```text
-meshctrl >
-```
-
-Type:
-
-```text
-list
-```
-
-to see connected bots.
+For production with TLS, use the automated setup scripts below.
 
 ---
 
-# Detailed Setup Guides
+# Automated Setup Scripts
 
-The `scripts/` folder contains fully automated setup scripts.
-
-These scripts:
-
-- generate secure secrets
-- configure TLS
-- prepare deployment packages
-- require minimal user input
+Three scripts in the `scripts/` folder handle everything. Run them in this order:
 
 ---
 
-# 1. Server Setup (Docker)
+## 1. Server Setup (`scripts/setup_server.sh`)
 
-Run this locally first.
-
-The script prepares a deployment folder for any Linux server with Docker installed.
-
-## Run the setup script
+Creates a deployment package (`~/meshcompute-deploy`) that you copy to any Linux server with Docker.
 
 ```bash
 cd scripts
@@ -168,68 +83,39 @@ chmod +x setup_server.sh
 ./setup_server.sh
 ```
 
----
-
-## You will be asked for
-
-- Public IP or domain
-- HTTPS port (default: `443`)
-
----
-
-## The script automatically
-
+### What it does:
+- Asks for server IP/domain + HTTPS port (default 443)
 - Generates:
   - `AUTH_TOKEN`
   - Redis password
-  - Bot secrets
-- Creates:
-  - Self-signed TLS certificate
-  - Docker deployment package
-- Builds:
-  - `meshcompute-deploy/`
+  - 3 bot secrets
+- Creates self-signed TLS certificate
+- Builds `~/meshcompute-deploy`
 
----
-
-## Copy deployment to server
+### Deploy to server:
 
 ```bash
-scp -r ../meshcompute-deploy user@your-server:~/
+scp -r ~/meshcompute-deploy user@your-server:~/
 ```
 
----
-
-## Start on the server
+### Start server:
 
 ```bash
 cd ~/meshcompute-deploy/docker
 docker compose up -d
 ```
 
-Server endpoint:
+Server runs at:
 
-```text
+```
 wss://your-domain:443/ws
 ```
 
 ---
 
-## Important
+## 2. Controller Setup (`scripts/setup_controller.sh`)
 
-Keep the generated secrets safe.
-
-You will need them for:
-
-- Controller authentication
-- Bot authentication
-
----
-
-# 2. Controller Setup
-
-Run this on the machine you will use to control bots.
-
-## Start setup
+Connects to an existing server.
 
 ```bash
 cd scripts
@@ -237,88 +123,24 @@ chmod +x setup_controller.sh
 ./setup_controller.sh
 ```
 
----
+### What it does:
+- Requests `AUTH_TOKEN`
+- Requests server URL
+- Creates `.env`
+- Configures controller for self-signed TLS
 
-## Required information
-
-- Server URL
-
-Example:
-
-```text
-wss://my-server.com:443/ws
-```
-
-- `AUTH_TOKEN`
-
-(from the server setup output)
-
----
-
-## The script will
-
-- Clone the repository
-- Install dependencies
-- Generate `.env`
-- Configure the controller automatically
-
----
-
-## Start controller
+### Start controller:
 
 ```bash
-cd ../meshcompute-controller
+cd ..
 python3 controller/main.py
 ```
 
-Prompt:
-
-```text
-meshctrl >
-```
-
 ---
 
-# 3. Bot Setup (Python or Build as EXE/APK)
+## 3. Bot Setup (`scripts/setup_bot.sh`)
 
-Each bot requires:
-
-- `bot_id`
-- `bot_secret`
-
-The server setup script generates:
-
-- `bot01`
-- `bot02`
-- `bot03`
-
-with unique secrets.
-
----
-
-# Option A — Run as Python Script
-
-Ideal for testing.
-
-```bash
-cd meshcompute
-
-export BOT_SECRET="<secret_for_bot01>"
-
-python3 client/main.py
-```
-
-The bot connects automatically.
-
----
-
-# Option B — Build EXE or APK
-
-Build a standalone executable with the secret baked in.
-
-No Python installation required on the target device.
-
-## Start build script
+Builds a standalone bot (EXE or APK).
 
 ```bash
 cd scripts
@@ -326,36 +148,38 @@ chmod +x setup_bot.sh
 ./setup_bot.sh
 ```
 
----
+### Options:
+- `exe` (Windows)
+- `apk` (Android)
 
-## The script asks for
-
-- Bot ID
-- Bot secret
-- Server URL
-- Target platform:
-  - `exe`
-  - `apk`
+### Output:
+- `meshcompute-bot/dist/meshbot.exe`
+- or APK in `meshcompute-bot/`
 
 ---
 
-## Output files
+## Run a bot
 
-Windows:
+### Option A – environment variables
 
-```text
-meshcompute-bot/dist/meshbot_bot01.exe
+```bash
+export BOT_ID="my-bot"
+export BOT_SECRET="secret"
+export SERVER_URL="wss://server:443/ws"
+python3 client/main.py
 ```
 
-Android:
+### Option B – JSON config
 
-```text
-meshcompute-bot/meshbot_bot01.apk
+```json
+{
+  "bot_id": "my-bot",
+  "bot_secret": "secret",
+  "server_url": "wss://server:443/ws"
+}
 ```
 
-Copy the generated file to the target machine and run it.
-
-The bot connects automatically.
+Place next to executable.
 
 ---
 
@@ -364,100 +188,26 @@ The bot connects automatically.
 | Command | Description |
 |---|---|
 | `list` | Show connected bots |
-| `shell <bot_id>` | Open interactive shell |
-| `exec <bot_id> <cmd>` | Execute shell command |
-| `sysinfo <bot_id>` | Display system information |
-| `ps <bot_id>` | List top processes |
-| `ping <bot_id>` | Ping a bot |
-| `python <bot_id> <code>` | Execute Python code |
-| `upload <bot_id> <file> [remote_name]` | Upload file |
-| `help` | Show help |
-| `exit` / `quit` | Disconnect controller |
+| `shell <id>` | Interactive remote shell |
+| `exec <id> <cmd>` | Run shell command |
+| `sysinfo <id>` | System information |
+| `ps <id>` | Top 30 processes |
+| `ping <id>` | Pong test |
+| `python <id> <code>` | Execute Python code |
+| `upload <id> <file>` | Send file |
 
----
-
-## Broadcast Support
-
-You may use:
-
-```text
-all
-```
-
-instead of a bot ID for:
-
-- `exec`
-- `sysinfo`
-- `ps`
-- `ping`
-- `upload`
-
-Not supported for:
-
-- `shell`
-- `python`
+Use `all` instead of an ID for mass commands (except `shell` and `python`).
 
 ---
 
 # Security
 
-MeshCompute includes multiple security layers.
-
----
-
-## TLS Encryption
-
-- Uses `wss://`
-- Self-signed certificate by default
-- Replaceable with Let's Encrypt certificates
-
----
-
-## Controller Authentication
-
-- `AUTH_TOKEN`
-- SHA-256 hashed on the server
-- Plain token never stored
-
----
-
-## Bot Authentication
-
-- Each bot requires a unique pre-shared secret
-- Unauthorized bots cannot connect
-
----
-
-## Redis Security
-
-- Password protected
-- Random secure password generation
-
----
-
-## File Upload Protection
-
-- Filenames sanitized
-- Prevents path traversal attacks
-
----
-
-## Secret Management
-
-- High entropy generated secrets
-- No hardcoded credentials
-
----
-
-# Production Recommendations
-
-For production deployments:
-
-- Use trusted TLS certificates
-- Enable Redis persistence
-- Configure backups
-- Run bots in containers or VMs
-- Restrict server access via firewall/VPN
+- **TLS:** WebSocket over `wss://`
+- **Controller auth:** SHA-256 hashed token
+- **Bot auth:** Pre-shared secrets required
+- **Redis password:** Randomly generated
+- **File safety:** Filename sanitization
+- **Certificates:** Self-signed by default, Let's Encrypt supported
 
 ---
 
@@ -466,89 +216,30 @@ For production deployments:
 ```text
 meshcompute/
 ├── builder/
-│   ├── generate_secrets.py
-│   ├── build_exe.py
-│   ├── build_apk.sh
-│   └── bot_configs/
-│
 ├── client/
-│   └── main.py
-│
 ├── controller/
-│   └── main.py
-│
 ├── common/
-│   └── config.py
-│
 ├── docker/
-│   ├── Dockerfile
-│   ├── docker-compose.yml
-│   └── .env.example.server
-│
 ├── scripts/
-│   ├── setup_server.sh
-│   ├── setup_controller.sh
-│   └── setup_bot.sh
-│
 ├── server/
-│   ├── main.go
-│   ├── go.mod
-│   └── go.sum
-│
 ├── requirements.txt
-├── .gitignore
 └── README.md
 ```
 
 ---
 
-# FAQ
+# Troubleshooting
 
-## Does MeshCompute require Docker?
-
-Only the server requires Docker.
-
-Bots and controllers can run directly with Python or as standalone binaries.
-
----
-
-## Can I use Let's Encrypt?
-
-Yes.
-
-Replace the generated self-signed certificate with your Let's Encrypt certificate files.
+| Problem | Fix |
+|---|---|
+| docker compose missing variables | `.env` not in docker folder |
+| SSL WRONG_VERSION_NUMBER | TLS mismatch (ws vs wss) |
+| CERTIFICATE_VERIFY_FAILED | Self-signed cert not trusted |
+| Bot disconnects immediately | Wrong BOT_SECRET |
+| go version error | downgrade go.mod to 1.21 |
 
 ---
 
-## Can multiple controllers connect?
+# Contributing
 
-Currently designed for a single controller connection.
-
----
-
-## Is Android supported?
-
-Yes.
-
-Bots can be compiled as APKs.
-
----
-
-## Is Windows supported?
-
-Yes.
-
-Bots can be built as standalone `.exe` files.
-
----
-
-# Disclaimer
-
-MeshCompute is intended for:
-
-- educational purposes
-- private infrastructure management
-- lab environments
-- authorized remote administration
-
-Only use it on systems you own or are explicitly authorized to manage.
+Pull requests are welcome. Open an issue first for discussion.

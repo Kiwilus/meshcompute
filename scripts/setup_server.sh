@@ -1,54 +1,54 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# Farben
 RED='\033[0;31m'; GREEN='\033[0;32m'; YELLOW='\033[1;33m'; BLUE='\033[0;34m'; NC='\033[0m'
-
 echo -e "${BLUE}========================================${NC}"
-echo -e "${BLUE}   MeshCompute Server Setup${NC}"
+echo -e "${BLUE}   MeshCompute Server Setup   ${NC}"
 echo -e "${BLUE}========================================${NC}"
 
-# Prüfen, ob nötige Programme da sind
-if ! command -v git &>/dev/null || ! command -v python3 &>/dev/null || ! command -v openssl &>/dev/null; then
-    echo -e "${RED}Fehler: Bitte installiere zuerst: git, python3, openssl${NC}"
-    exit 1
-fi
+for cmd in git python3 openssl; do
+    if ! command -v "$cmd" &>/dev/null; then
+        echo -e "${RED}Fehler: '$cmd' nicht installiert.${NC}"; exit 1
+    fi
+done
 
-# Fragen
-read -p "Öffentliche IP / Domain des Servers (z.B. mein-server.de): " SERVER_HOST
+read -p "Öffentliche IP / Domain des Servers: " SERVER_HOST
 SERVER_PORT=443
-read -p "HTTPS-Port? [Standard: 443]: " input_port
+read -p "HTTPS-Port? [Standard: $SERVER_PORT]: " input_port
 SERVER_PORT=${input_port:-$SERVER_PORT}
 
-REPO_URL="https://github.com/Kiwilus/meshcompute.git"
-WORKDIR="$(pwd)/meshcompute"
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+REPO_DIR="$(dirname "$SCRIPT_DIR")"         # das MeshCompute-Hauptverzeichnis
+DEPLOY_DIR="$HOME/meshcompute-deploy"
 
-# Repository klonen, falls nicht vorhanden
-if [ ! -d "$WORKDIR" ]; then
-    echo -e "${GREEN}Klone Repository...${NC}"
-    git clone "$REPO_URL" "$WORKDIR"
-fi
-cd "$WORKDIR"
+echo -e "${GREEN}Repository: $REPO_DIR${NC}"
+echo -e "${GREEN}Deployment-Ordner: $DEPLOY_DIR${NC}"
 
-# Python-Abhängigkeiten für den Generator
+cd "$REPO_DIR"
 pip3 install -r requirements.txt -q 2>/dev/null
 
-# Zufällige Secrets generieren
+# Secrets
 AUTH_TOKEN=$(python3 -c "import secrets; print(secrets.token_hex(32))")
 REDIS_PASSWORD=$(python3 -c "import secrets; print(secrets.token_hex(16))")
 BOT_SECRET1=$(python3 -c "import secrets; print(secrets.token_hex(16))")
 BOT_SECRET2=$(python3 -c "import secrets; print(secrets.token_hex(16))")
 BOT_SECRET3=$(python3 -c "import secrets; print(secrets.token_hex(16))")
-
 BOT_SECRETS_JSON="{\"bot01\":\"$BOT_SECRET1\",\"bot02\":\"$BOT_SECRET2\",\"bot03\":\"$BOT_SECRET3\"}"
 
-# TLS-Zertifikat generieren
-mkdir -p ssl
-openssl req -x509 -newkey rsa:4096 -keyout ssl/key.pem -out ssl/cert.pem -days 365 -nodes \
-    -subj "/CN=${SERVER_HOST}" 2>/dev/null
+# Zertifikat
+mkdir -p "$REPO_DIR/ssl"
+openssl req -x509 -newkey rsa:4096 -keyout "$REPO_DIR/ssl/key.pem" -out "$REPO_DIR/ssl/cert.pem" \
+    -days 365 -nodes -subj "/CN=${SERVER_HOST}" 2>/dev/null
 
-# .env Datei schreiben
-cat > .env << EOF
+# Deployment-Ordner erstellen (außerhalb des Repos, unter $HOME)
+rm -rf "$DEPLOY_DIR"
+mkdir -p "$DEPLOY_DIR"
+cp -r "$REPO_DIR/server" "$DEPLOY_DIR/"
+cp -r "$REPO_DIR/docker" "$DEPLOY_DIR/"
+cp -r "$REPO_DIR/ssl" "$DEPLOY_DIR/"
+
+# .env direkt in den docker/ Ordner schreiben
+cat > "$DEPLOY_DIR/docker/.env" << EOF
 AUTH_TOKEN=$AUTH_TOKEN
 BOT_SECRETS='$BOT_SECRETS_JSON'
 REDIS_URL=redis://redis:6379
@@ -60,43 +60,62 @@ TLS_KEY=/certs/key.pem
 SERVER_URL=wss://${SERVER_HOST}:${SERVER_PORT}/ws
 EOF
 
-# Deployment-Ordner vorbereiten
-DEPLOY_DIR="$WORKDIR/../meshcompute-deploy"
-rm -rf "$DEPLOY_DIR"
-mkdir -p "$DEPLOY_DIR"
+# Saubere docker-compose.yml schreiben
+cat > "$DEPLOY_DIR/docker/docker-compose.yml" << 'YML'
+version: '3.8'
 
-# Notwendige Dateien kopieren
-cp -r "$WORKDIR/server" "$DEPLOY_DIR/"
-cp -r "$WORKDIR/docker" "$DEPLOY_DIR/"
-cp "$WORKDIR/.env" "$DEPLOY_DIR/"
-cp -r "$WORKDIR/ssl" "$DEPLOY_DIR/"
+services:
+  redis:
+    image: redis:7-alpine
+    command: redis-server --requirepass ${REDIS_PASSWORD:-redis_geheim}
+    networks:
+      - meshnet
+    volumes:
+      - redis_data:/data
 
-# docker-compose.yml anpassen, damit TLS und Volumes eingebunden werden
-cd "$DEPLOY_DIR/docker"
-# Füge TLS-Umgebungsvariablen und Volume in docker-compose.yml ein
-if ! grep -q "TLS_CERT" docker-compose.yml; then
-    cp docker-compose.yml docker-compose.yml.bak
-    sed -i '/REDIS_PASSWORD:.*/a\      TLS_CERT: ${TLS_CERT:-}\n      TLS_KEY: ${TLS_KEY:-}\n      SERVER_HOST: ${SERVER_HOST}' docker-compose.yml
-    sed -i '/depends_on:/i\    volumes:\n      - ../ssl:/certs:ro' docker-compose.yml
-fi
+  server:
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile
+    environment:
+      AUTH_TOKEN: ${AUTH_TOKEN}
+      BOT_SECRETS: ${BOT_SECRETS}
+      REDIS_URL: redis:6379
+      REDIS_PASSWORD: ${REDIS_PASSWORD:-redis_geheim}
+      SERVER_PORT: "8080"
+      TLS_CERT: ${TLS_CERT:-}
+      TLS_KEY: ${TLS_KEY:-}
+      SERVER_HOST: ${SERVER_HOST}
+    ports:
+      - "${SERVER_PORT:-443}:8080"
+    volumes:
+      - ../ssl:/certs:ro
+    networks:
+      - meshnet
+    depends_on:
+      - redis
 
-cd "$DEPLOY_DIR"
+volumes:
+  redis_data:
+
+networks:
+  meshnet:
+YML
 
 echo ""
 echo -e "${GREEN}========================================${NC}"
-echo -e "${GREEN}   Server-Deployment vorbereitet!${NC}"
+echo -e "${GREEN}   Server-Deployment fertig!${NC}"
 echo -e "${GREEN}========================================${NC}"
 echo ""
-echo -e "Deployment-Ordner: ${YELLOW}$DEPLOY_DIR${NC}"
-echo -e "Kopiere diesen Ordner auf deinen Server, z.B.:"
-echo -e "  ${YELLOW}scp -r $DEPLOY_DIR nutzer@dein-server:~/meshcompute-deploy${NC}"
+echo -e "Kopiere den Ordner auf deinen Server:"
+echo -e "  ${YELLOW}scp -r $DEPLOY_DIR kiwi@192.168.1.188:/home/kiwi${NC}"
 echo ""
 echo -e "Dann auf dem Server:"
 echo -e "  ${YELLOW}cd ~/meshcompute-deploy/docker && docker compose up -d${NC}"
 echo ""
-echo -e "${RED}Wichtige Secrets (bitte sicher aufbewahren):${NC}"
-echo -e "  AUTH_TOKEN:        $AUTH_TOKEN"
-echo -e "  Redis-Passwort:    $REDIS_PASSWORD"
+echo -e "${RED}Wichtige Geheimnisse:${NC}"
+echo -e "  AUTH_TOKEN:      $AUTH_TOKEN"
+echo -e "  Redis-Passwort:  $REDIS_PASSWORD"
 echo -e "  Bot-Secrets:"
 echo -e "    bot01: $BOT_SECRET1"
 echo -e "    bot02: $BOT_SECRET2"
