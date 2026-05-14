@@ -36,15 +36,23 @@ class MeshServer:
 
     async def broadcast_task(self, task: dict, target="all"):
         r = await self.get_redis()
-        count = 0
-        for ws, info in list(self.clients.items()):
-            if target == "all" or info["bot_id"] == target:
-                try:
-                    await r.rpush("mesh:tasks", json.dumps(task))
-                    count += 1
-                except Exception as e:
-                    logging.error(f"Failed to queue task to {info['bot_id']}: {e}")
-        return count
+
+        if target == "all":
+            await r.rpush("mesh:tasks", json.dumps(task))
+            # Anzahl aktiver Bots als count zurückgeben
+            count = await r.scard("active_bots")
+            return count
+        else:
+            # Prüfen ob Bot in Redis registriert ist
+            known_bots = await r.smembers("active_bots")
+            # Partial match: "cf7586b6" matcht "cf7586b6-kevin-ms"
+            matched = [b for b in known_bots
+                       if b == target or b.startswith(target) or target.startswith(b.split('-')[0])]
+
+            if matched:
+                await r.rpush("mesh:tasks", json.dumps(task))
+                return len(matched)
+            return 0
 
     async def handler(self, ws):
         """Einheitlicher Handler für alle Verbindungen"""
