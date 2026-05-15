@@ -18,9 +18,8 @@ read -p "HTTPS-Port? [Standard: $SERVER_PORT]: " input_port
 SERVER_PORT=${input_port:-$SERVER_PORT}
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
-REPO_DIR="$(dirname "$SCRIPT_DIR")"         # das MeshCompute-Hauptverzeichnis
+REPO_DIR="$(dirname "$SCRIPT_DIR")"
 DEPLOY_DIR="$HOME/meshcompute-deploy"
-
 echo -e "${GREEN}Repository: $REPO_DIR${NC}"
 echo -e "${GREEN}Deployment-Ordner: $DEPLOY_DIR${NC}"
 
@@ -30,6 +29,8 @@ pip3 install -r requirements.txt -q 2>/dev/null
 # Secrets
 AUTH_TOKEN=$(python3 -c "import secrets; print(secrets.token_hex(32))")
 REDIS_PASSWORD=$(python3 -c "import secrets; print(secrets.token_hex(16))")
+REGISTRATION_TOKEN=$(python3 -c "import secrets; print(secrets.token_hex(24))")
+# Statische Bot-Secrets (optional, wenn du weiterhin manuelle Bots erlauben willst)
 BOT_SECRET1=$(python3 -c "import secrets; print(secrets.token_hex(16))")
 BOT_SECRET2=$(python3 -c "import secrets; print(secrets.token_hex(16))")
 BOT_SECRET3=$(python3 -c "import secrets; print(secrets.token_hex(16))")
@@ -40,19 +41,20 @@ mkdir -p "$REPO_DIR/ssl"
 openssl req -x509 -newkey rsa:4096 -keyout "$REPO_DIR/ssl/key.pem" -out "$REPO_DIR/ssl/cert.pem" \
     -days 365 -nodes -subj "/CN=${SERVER_HOST}" 2>/dev/null
 
-# Deployment-Ordner erstellen (außerhalb des Repos, unter $HOME)
+# Deployment-Ordner
 rm -rf "$DEPLOY_DIR"
 mkdir -p "$DEPLOY_DIR"
 cp -r "$REPO_DIR/server" "$DEPLOY_DIR/"
 cp -r "$REPO_DIR/docker" "$DEPLOY_DIR/"
 cp -r "$REPO_DIR/ssl" "$DEPLOY_DIR/"
 
-# .env direkt in den docker/ Ordner schreiben
+# .env schreiben (direkt in docker/)
 cat > "$DEPLOY_DIR/docker/.env" << EOF
 AUTH_TOKEN=$AUTH_TOKEN
 BOT_SECRETS='$BOT_SECRETS_JSON'
 REDIS_URL=redis://redis:6379
 REDIS_PASSWORD=$REDIS_PASSWORD
+REGISTRATION_TOKEN=$REGISTRATION_TOKEN
 SERVER_PORT=$SERVER_PORT
 SERVER_HOST=$SERVER_HOST
 TLS_CERT=/certs/cert.pem
@@ -60,7 +62,7 @@ TLS_KEY=/certs/key.pem
 SERVER_URL=wss://${SERVER_HOST}:${SERVER_PORT}/ws
 EOF
 
-# Saubere docker-compose.yml schreiben
+# docker-compose.yml überschreiben (sauberes Setup)
 cat > "$DEPLOY_DIR/docker/docker-compose.yml" << 'YML'
 version: '3.8'
 
@@ -82,6 +84,7 @@ services:
       BOT_SECRETS: ${BOT_SECRETS}
       REDIS_URL: redis:6379
       REDIS_PASSWORD: ${REDIS_PASSWORD:-redis_geheim}
+      REGISTRATION_TOKEN: ${REGISTRATION_TOKEN}
       SERVER_PORT: "8080"
       TLS_CERT: ${TLS_CERT:-}
       TLS_KEY: ${TLS_KEY:-}
@@ -111,12 +114,13 @@ echo -e "Kopiere den Ordner auf deinen Server:"
 echo -e "  ${YELLOW}scp -r $DEPLOY_DIR kiwi@192.168.1.188:/home/kiwi${NC}"
 echo ""
 echo -e "Dann auf dem Server:"
-echo -e "  ${YELLOW}cd ~/meshcompute-deploy/docker && docker compose up -d${NC}"
+echo -e "  ${YELLOW}cd ~/meshcompute-deploy/docker && docker compose up -d --build${NC}"
 echo ""
 echo -e "${RED}Wichtige Geheimnisse:${NC}"
-echo -e "  AUTH_TOKEN:      $AUTH_TOKEN"
-echo -e "  Redis-Passwort:  $REDIS_PASSWORD"
-echo -e "  Bot-Secrets:"
+echo -e "  AUTH_TOKEN:           $AUTH_TOKEN"
+echo -e "  Redis-Passwort:       $REDIS_PASSWORD"
+echo -e "  Registration Token:   $REGISTRATION_TOKEN"
+echo -e "  Bot-Secrets (fest):"
 echo -e "    bot01: $BOT_SECRET1"
 echo -e "    bot02: $BOT_SECRET2"
 echo -e "    bot03: $BOT_SECRET3"

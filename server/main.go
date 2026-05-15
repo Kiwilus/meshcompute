@@ -20,12 +20,13 @@ import (
 )
 
 var (
-	authTokenHash string
-	redisAddr     string
-	redisPassword string
-	serverPort    = ":8080"
-	botSecrets    map[string]string // bot_id -> secret
-	botAuthOn     bool
+	authTokenHash       string
+	registrationTokenHash string
+	redisAddr           string
+	redisPassword       string
+	serverPort          = ":8080"
+	botSecrets          map[string]string // bot_id -> secret
+	botAuthOn           bool
 )
 
 type Client struct {
@@ -45,7 +46,7 @@ type Hub struct {
 
 var (
 	hub           *Hub
-	shellSessions sync.Map // task_id -> bot_id
+	shellSessions sync.Map
 )
 
 func main() {
@@ -53,18 +54,27 @@ func main() {
 	token := getEnv("AUTH_TOKEN", "change_me_please_secure_token_123")
 	authTokenHash = hashString(token)
 
+	// --- Registration-Token ---
+	regToken := getEnv("REGISTRATION_TOKEN", "")
+	if regToken != "" {
+		registrationTokenHash = hashString(regToken)
+		log.Println("Bot-Registrierung AKTIVIERT")
+	} else {
+		log.Println("Bot-Registrierung DEAKTIVIERT (REGISTRATION_TOKEN nicht gesetzt)")
+	}
+
 	// --- Redis ---
 	redisAddr = getEnv("REDIS_URL", "localhost:6379")
 	redisPassword = getEnv("REDIS_PASSWORD", "")
 
-	// --- Bot-Authentifizierung ---
+	// --- Bot-Authentifizierung (statische Secrets) ---
 	secretsJSON := os.Getenv("BOT_SECRETS")
 	if secretsJSON != "" {
 		if err := json.Unmarshal([]byte(secretsJSON), &botSecrets); err != nil {
 			log.Fatalf("Fehler beim Parsen von BOT_SECRETS: %v", err)
 		}
 		botAuthOn = true
-		log.Println("Bot-Authentifizierung AKTIVIERT")
+		log.Println("Statische Bot-Authentifizierung AKTIVIERT")
 	} else {
 		log.Println("Warnung: Keine BOT_SECRETS gesetzt – Bots werden ohne Authentifizierung akzeptiert")
 	}
@@ -82,7 +92,6 @@ func main() {
 		}),
 	}
 
-	// Redis-Verbindung testen
 	if _, err := hub.redis.Ping(context.Background()).Result(); err != nil {
 		log.Printf("Warnung: Redis nicht erreichbar: %v", err)
 	}
@@ -92,7 +101,6 @@ func main() {
 
 	http.HandleFunc("/ws", handleWebSocket)
 
-	// Optional: TLS aktivieren wenn Zertifikate vorhanden
 	if os.Getenv("TLS_CERT") != "" && os.Getenv("TLS_KEY") != "" {
 		log.Printf("MeshCompute Server läuft auf wss://0.0.0.0%s", serverPort)
 		log.Fatal(http.ListenAndServeTLS(serverPort, os.Getenv("TLS_CERT"), os.Getenv("TLS_KEY"), nil))
@@ -161,38 +169,83 @@ func handleClient(c *Client) {
 	}()
 
 	var initMsg struct {
-		Type      string `json:"type"`
-		AuthToken string `json:"auth_token,omitempty"`
-		BotID     string `json:"bot_id,omitempty"`
-		BotSecret string `json:"bot_secret,omitempty"`
+		Type              string `json:"type"`
+		AuthToken         string `json:"auth_token,omitempty"`
+		RegistrationToken string `json:"registration_token,omitempty"`
+		BotID             string `json:"bot_id,omitempty"`
+		BotSecret         string `json:"bot_secret,omitempty"`
 	}
 	if err := wsjson.Read(c.ctx, c.conn, &initMsg); err != nil {
 		return
 	}
 
-	if initMsg.Type == "controller" {
+	switch initMsg.Type {
+	case "controller":
 		if hashString(initMsg.AuthToken) != authTokenHash {
 			log.Println("❌ Falscher Auth Token")
 			return
 		}
 		c.typ = "controller"
 		c.id = "ctrl_" + fmt.Sprint(time.Now().UnixNano())
-	} else if initMsg.Type == "client" && initMsg.BotID != "" {
-		// Bot-Authentifizierung, wenn aktiv
+
+	case "register_bot":
+		// Bot-Registrierung nur mit gültigem Registration-Token
+		if registrationTokenHash == "" || hashString(initMsg.RegistrationToken) != registrationTokenHash {
+			log.Println("❌ Bot-Registrierung fehlgeschlagen: ungültiges Registration Token")
+			return
+		}
+		newID := initMsg.BotID
+		if newID == "" {
+			newID = "bot-" + fmt.Sprint(time.Now().UnixNano())
+		}
+		newSecret := initMsg.BotSecret
+		if newSecret == "" {
+			newSecret = fmt.Sprintf("%x", sha256.Sum256([]byte(newID+fmt.Sprint(time.Now().UnixNano()))))
+		}
+		// Speichere das Secret in Redis (und ggf. in lokaler Map)
+		hub.redis.HSet(context.Background(), "registered_bots", newID, newSecret)
+		// Teile dem Bot seine neuen Credentials mit
+		wsjson.Write(c.ctx, c.conn, map[string]interface{}{
+			"type":       "registration_ok",
+			"bot_id":     newID,
+			"bot_secret": newSecret,
+		})
+		log.Printf("✅ Neuer Bot registriert: %s", newID)
+		c.conn.Close(websocket.StatusNormalClosure, "registration done")
+		return
+
+	case "client":
+		if initMsg.BotID == "" {
+			return
+		}
+		// Prüfe zuerst statische Secrets, dann dynamisch registrierte
+		authenticated := false
 		if botAuthOn {
 			expectedSecret, exists := botSecrets[initMsg.BotID]
-			if !exists || initMsg.BotSecret != expectedSecret {
-				log.Printf("❌ Bot-Authentifizierung fehlgeschlagen für %s", initMsg.BotID)
-				return
+			if exists && initMsg.BotSecret == expectedSecret {
+				authenticated = true
 			}
+		} else {
+			authenticated = true
+		}
+		if !authenticated {
+			// Prüfe in Redis registrierte Bots
+			regSecret, err := hub.redis.HGet(context.Background(), "registered_bots", initMsg.BotID).Result()
+			if err == nil && regSecret == initMsg.BotSecret {
+				authenticated = true
+			}
+		}
+		if !authenticated {
+			log.Printf("❌ Bot-Authentifizierung fehlgeschlagen für %s", initMsg.BotID)
+			return
 		}
 		c.typ = "client"
 		c.id = initMsg.BotID
-		ctx := context.Background()
-		hub.redis.SAdd(ctx, "active_bots", c.id)
-		hub.redis.HSet(ctx, "bot:"+c.id, "heartbeat", time.Now().Unix())
+		hub.redis.SAdd(context.Background(), "active_bots", c.id)
+		hub.redis.HSet(context.Background(), "bot:"+c.id, "heartbeat", time.Now().Unix())
 		go heartbeatSender(c)
-	} else {
+
+	default:
 		return
 	}
 
@@ -261,14 +314,11 @@ func (h *Hub) sendBotList(controller *Client, taskID string) {
 			})
 		}
 	}
-	response := map[string]interface{}{
+	wsjson.Write(controller.ctx, controller.conn, map[string]interface{}{
 		"type":    "result",
 		"task_id": taskID,
-		"data": map[string]interface{}{
-			"bots": bots,
-		},
-	}
-	wsjson.Write(controller.ctx, controller.conn, response)
+		"data":    map[string]interface{}{"bots": bots},
+	})
 }
 
 func (h *Hub) startShellSession(controller *Client, msg map[string]interface{}) {

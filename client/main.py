@@ -7,69 +7,76 @@ import psutil
 import logging
 import shlex
 import os
+import sys
 import socket
 import base64
 from pathlib import Path
-from dotenv import load_dotenv
 import websockets
 
-# Importiere Konfiguration aus common
-from common.config import SERVER_URL as DEFAULT_SERVER_URL, MAX_COMMAND_TIMEOUT
-
-load_dotenv()
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
 
-# ====================== KONFIGURATION ======================
-def load_config():
-    """Liest Bot-Konfiguration aus bot_config.json, Umgebungsvariablen oder Standardwerten."""
-    # 1. bot_config.json (höchste Priorität)
-    config_path = Path("bot_config.json")
-    if config_path.exists():
+CONFIG_FILE = Path("bot_credentials.json")
+MAX_COMMAND_TIMEOUT = int(os.getenv("MAX_COMMAND_TIMEOUT", "60"))
+
+# ====================== KONFIGURATION LADEN ======================
+def _load_build_config():
+    """Importiert die vom Build-Skript erzeugte build_config.py."""
+    try:
+        # PyInstaller entpackt Daten nach sys._MEIPASS
+        if getattr(sys, 'frozen', False):
+            sys.path.insert(0, sys._MEIPASS)
+        import build_config
+        return {
+            "server_url": build_config.SERVER_URL,
+            "registration_token": build_config.REGISTRATION_TOKEN,
+        }
+    except ImportError:
+        return None
+
+build_cfg = _load_build_config()
+if build_cfg:
+    SERVER_URL = build_cfg["server_url"]
+    REGISTRATION_TOKEN = build_cfg["registration_token"]
+else:
+    SERVER_URL = "wss://192.168.1.188:443/ws"
+    REGISTRATION_TOKEN = "4a371b47dffe9807dccb004975b28fa686003ff73f7bd868"
+
+# ====================== BESTEHENDE CREDENTIALS ======================
+def load_existing_config():
+    if CONFIG_FILE.exists():
         try:
-            with open(config_path, "r") as f:
+            with open(CONFIG_FILE) as f:
                 data = json.load(f)
-            return (
-                data.get("bot_id") or data.get("BOT_ID"),
-                data.get("bot_secret") or data.get("BOT_SECRET"),
-                data.get("server_url") or data.get("SERVER_URL")
-            )
-        except Exception as e:
-            logger.error(f"Konfigurationsdatei beschädigt: {e}")
+            if data.get("bot_id") and data.get("bot_secret"):
+                return data["bot_id"], data["bot_secret"]
+        except Exception:
+            pass
+    env_id = os.getenv("BOT_ID")
+    env_secret = os.getenv("BOT_SECRET")
+    if env_id and env_secret:
+        return env_id, env_secret
+    return None, None
 
-    # 2. Umgebungsvariablen (teilweise befüllt möglich)
-    bot_id = os.getenv("BOT_ID")
-    bot_secret = os.getenv("BOT_SECRET")
-    server_url = os.getenv("SERVER_URL")
-
-    # Wenn nur BOT_SECRET gesetzt ist, ergänze die fehlenden Werte automatisch
-    if bot_secret and not bot_id:
-        # BOT_ID aus vorhandener Datei oder neu generieren
-        id_file = Path("client/bot_id.txt")
-        if id_file.exists():
-            bot_id = id_file.read_text().strip()
-        else:
-            bot_id = f"{socket.gethostname()}-{str(uuid.uuid4())[:8]}"
-            id_file.parent.mkdir(parents=True, exist_ok=True)
-            id_file.write_text(bot_id)
-
-    if bot_secret and not server_url:
-        server_url = DEFAULT_SERVER_URL  # aus common/config.py
-
-    # Nur zurückgeben, wenn mindestens ID und URL vorhanden sind
-    if bot_id and server_url:
-        return bot_id, bot_secret, server_url
-
-    return None, None, None
-
-BOT_ID, BOT_SECRET, SERVER_URL = load_config()
-if not BOT_ID or not SERVER_URL:
-    print("❌ Keine gültige Konfiguration gefunden.")
-    print("Erstelle eine 'bot_config.json' im gleichen Ordner wie diese EXE mit:")
-    print('{"bot_id": "dein-bot", "bot_secret": "geheim", "server_url": "wss://server:443/ws"}')
-    print("Alternativ setze die Umgebungsvariablen BOT_ID, BOT_SECRET und SERVER_URL.")
-    import sys
-    sys.exit(1)
+async def register_bot(bot_id, server_url, reg_token):
+    try:
+        import ssl
+        ssl_context = ssl.create_default_context()
+        ssl_context.check_hostname = False
+        ssl_context.verify_mode = ssl.CERT_NONE
+        async with websockets.connect(server_url, ssl=ssl_context) as ws:
+            await ws.send(json.dumps({
+                "type": "register_bot",
+                "bot_id": bot_id,
+                "registration_token": reg_token,
+            }))
+            response = await asyncio.wait_for(ws.recv(), timeout=10)
+            data = json.loads(response)
+            if data.get("type") == "registration_ok":
+                return data["bot_id"], data["bot_secret"]
+    except Exception as e:
+        logger.error(f"Registrierungsfehler: {e}")
+    return None
 
 # ====================== HILFSFUNKTIONEN ======================
 async def get_system_info():
@@ -109,10 +116,29 @@ async def execute_command(cmd: str, timeout=MAX_COMMAND_TIMEOUT):
 
 # ====================== MAIN ======================
 async def main():
+    global BOT_ID, BOT_SECRET
+
+    existing = load_existing_config()
+    if existing:
+        BOT_ID, BOT_SECRET = existing
+    else:
+        if not REGISTRATION_TOKEN:
+            print("❌ Bot konnte nicht gestartet werden. Kein REGISTRATION_TOKEN und keine lokale Konfiguration.")
+            sys.exit(1)
+        BOT_ID = f"{socket.gethostname()}-{str(uuid.uuid4())[:8]}"
+        result = await register_bot(BOT_ID, SERVER_URL, REGISTRATION_TOKEN)
+        if result:
+            BOT_ID, BOT_SECRET = result
+            with open(CONFIG_FILE, "w") as f:
+                json.dump({"bot_id": BOT_ID, "bot_secret": BOT_SECRET}, f)
+        else:
+            print("❌ Registrierung fehlgeschlagen.")
+            sys.exit(1)
+
     print(f"MeshCompute Client gestartet → {BOT_ID}")
+
     while True:
         try:
-            # SSL-Kontext für selbstsignierte Zertifikate
             import ssl
             ssl_context = ssl.create_default_context()
             ssl_context.check_hostname = False
@@ -122,13 +148,12 @@ async def main():
                 await ws.send(json.dumps({
                     "type": "client",
                     "bot_id": BOT_ID,
-                    "bot_secret": BOT_SECRET or ""
+                    "bot_secret": BOT_SECRET
                 }))
                 logger.info(f"✅ Verbunden als {BOT_ID}")
                 async for raw_msg in ws:
                     try:
                         msg = json.loads(raw_msg)
-
                         if msg.get("action") == "shell":
                             await ws.send(json.dumps({
                                 "type": "shell_output",
